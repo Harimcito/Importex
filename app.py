@@ -7,6 +7,7 @@ import io
 import imaplib
 import ipaddress
 import json
+import os
 import re
 import secrets
 import smtplib
@@ -29,9 +30,50 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "comercio.sqlite3"
+ENV_PATH = ROOT / ".env"
 PORT = 8765
 ML_REFRESH_LOCK = threading.Lock()
 IMAP_SCAN_LOCK = threading.Lock()
+
+
+def load_private_env():
+    """Load this single-user app's private .env without overriding process settings."""
+    try:
+        for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip().lstrip("\ufeff")
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if value[:1] == value[-1:] and value.startswith(("'", '"')) and len(value) >= 2:
+                value = value[1:-1]
+            if key.startswith("IMPORTEX_"):
+                os.environ.setdefault(key, value)
+    except OSError:
+        pass
+
+
+load_private_env()
+
+
+def private_setting(name, default=""):
+    return os.environ.get("IMPORTEX_" + name, default).strip()
+
+
+def configured_secret(values, env_name, db_key):
+    """Return secret value and its source, preferring private backend configuration."""
+    env_value = private_setting(env_name)
+    if env_value:
+        return env_value, "backend"
+    encrypted = values.get(db_key, "")
+    if encrypted:
+        return reveal_secret(encrypted), "local_encrypted"
+    return "", "missing"
+
+
+def configured_value(values, env_name, db_key, default=""):
+    return private_setting(env_name) or values.get(db_key, default)
 
 
 def connect_db():
@@ -346,7 +388,8 @@ def fetch_bde_usd_clp(token):
 
 def get_chilecompra_status(db):
     values = read_settings(db)
-    return {"configured": bool(values.get("chilecompra_ticket_encrypted", "")),
+    _, source = configured_secret(values, "CHILECOMPRA_API_TICKET", "chilecompra_ticket_encrypted")
+    return {"configured": source != "missing", "credential_source": source,
             "last_check": values.get("chilecompra_last_check", ""),
             "last_status": values.get("chilecompra_last_status", "Sin validar")}
 
@@ -424,8 +467,8 @@ def oauth_post(form):
 def get_ml_access_token(db):
     with ML_REFRESH_LOCK:
         values = read_settings(db)
-        client_id = values.get("ml_client_id", "")
-        client_secret = values.get("ml_client_secret_encrypted", "")
+        client_id = configured_value(values, "MERCADOLIBRE_CLIENT_ID", "ml_client_id")
+        client_secret, _ = configured_secret(values, "MERCADOLIBRE_CLIENT_SECRET", "ml_client_secret_encrypted")
         access_encrypted = values.get("ml_access_token_encrypted", "")
         refresh_encrypted = values.get("ml_refresh_token_encrypted", "")
         expiry = int(values.get("ml_access_expires_at", "0") or 0)
@@ -434,7 +477,7 @@ def get_ml_access_token(db):
         if not all((client_id, client_secret, refresh_encrypted)):
             raise ValueError("Conecta tu aplicación oficial de MercadoLibre antes de consultar.")
         refreshed = oauth_post({"grant_type": "refresh_token", "client_id": client_id,
-                                "client_secret": reveal_secret(client_secret),
+                                "client_secret": client_secret,
                                 "refresh_token": reveal_secret(refresh_encrypted)})
         if not refreshed.get("access_token") or not refreshed.get("refresh_token"):
             raise ValueError("MercadoLibre no devolvió tokens renovados; vuelve a autorizar la aplicación.")
@@ -447,8 +490,8 @@ def get_ml_access_token(db):
 
 def create_ml_authorization(db):
     values = read_settings(db)
-    client_id = values.get("ml_client_id", "")
-    redirect_uri = values.get("ml_redirect_uri", "")
+    client_id = configured_value(values, "MERCADOLIBRE_CLIENT_ID", "ml_client_id")
+    redirect_uri = configured_value(values, "MERCADOLIBRE_REDIRECT_URI", "ml_redirect_uri")
     if not client_id or not redirect_uri:
         raise ValueError("Guarda primero el Client ID y la Redirect URI de tu aplicación.")
     state = secrets.token_urlsafe(24)
@@ -464,12 +507,13 @@ def exchange_ml_authorization(db, code, state):
     started = int(values.get("ml_oauth_pending_at", "0") or 0)
     if not expected or not secrets.compare_digest(expected, state) or time.time() - started > 900:
         raise ValueError("La autorización venció o no coincide. Inicia una nueva conexión.")
-    client_id, redirect_uri = values.get("ml_client_id", ""), values.get("ml_redirect_uri", "")
-    secret_encrypted = values.get("ml_client_secret_encrypted", "")
-    if not all((client_id, redirect_uri, secret_encrypted, code)):
+    client_id = configured_value(values, "MERCADOLIBRE_CLIENT_ID", "ml_client_id")
+    redirect_uri = configured_value(values, "MERCADOLIBRE_REDIRECT_URI", "ml_redirect_uri")
+    client_secret, _ = configured_secret(values, "MERCADOLIBRE_CLIENT_SECRET", "ml_client_secret_encrypted")
+    if not all((client_id, redirect_uri, client_secret, code)):
         raise ValueError("Falta el Client ID, Client Secret, código o Redirect URI.")
     token_data = oauth_post({"grant_type": "authorization_code", "client_id": client_id,
-                             "client_secret": reveal_secret(secret_encrypted), "code": code,
+                             "client_secret": client_secret, "code": code,
                              "redirect_uri": redirect_uri})
     if not token_data.get("access_token") or not token_data.get("refresh_token"):
         raise ValueError("MercadoLibre no devolvió los tokens esperados.")
@@ -513,11 +557,12 @@ def mercadolibre_search(payload, access_token):
 
 def market_automation_status(db):
     values = read_settings(db)
+    client_id = configured_value(values, "MERCADOLIBRE_CLIENT_ID", "ml_client_id")
+    redirect_uri = configured_value(values, "MERCADOLIBRE_REDIRECT_URI", "ml_redirect_uri", "https://www.mercadolibre.cl")
     return {"enabled": values.get("daily_market_enabled", "0") == "1",
             "time": values.get("daily_market_time", "10:00"),
             "connected": bool(values.get("ml_refresh_token_encrypted", "")),
-            "client_id": values.get("ml_client_id", ""),
-            "redirect_uri": values.get("ml_redirect_uri", "https://www.mercadolibre.cl"),
+            "app_configured": bool(client_id and configured_secret(values, "MERCADOLIBRE_CLIENT_SECRET", "ml_client_secret_encrypted")[0]),
             "last_run": values.get("daily_market_last_run", ""),
             "last_status": values.get("daily_market_last_status", "Sin ejecución automática"),
             "last_count": int(values.get("daily_market_last_count", "0") or 0),
@@ -1162,15 +1207,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-config":
                 values = read_settings(db)
-                self.send_json({"model": values.get("openai_model", "gpt-6-astra"),
-                                "configured": bool(values.get("openai_api_key_encrypted", ""))})
+                _, source = configured_secret(values, "OPENAI_API_KEY", "openai_api_key_encrypted")
+                self.send_json({"model": configured_value(values, "OPENAI_MODEL", "openai_model", "gpt-6-astra"),
+                                "configured": source != "missing", "credential_source": source})
                 return
             if path == "/api/chilecompra-config":
                 self.send_json(get_chilecompra_status(db))
                 return
             if path == "/api/bde-config":
                 values = read_settings(db)
-                self.send_json({"configured": bool(values.get("bde_api_token_encrypted", ""))})
+                _, source = configured_secret(values, "BDE_API_KEY_TOKEN", "bde_api_token_encrypted")
+                self.send_json({"configured": source != "missing", "credential_source": source})
                 return
             if path == "/api/email-reviews":
                 rows = [dict(r) for r in db.execute("SELECT id,sender,subject,message_date,parsed_json,status,captured_at FROM email_quote_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
@@ -1188,24 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self.body_json()
             if path == "/api/mercadolibre/config":
-                client_id = str(payload.get("client_id", "")).strip()[:30]
-                secret = str(payload.get("client_secret", ""))
-                redirect_uri = str(payload.get("redirect_uri", "")).strip()[:500]
-                parsed_redirect = urllib.parse.urlparse(redirect_uri)
-                if not re.fullmatch(r"\d{1,20}", client_id):
-                    raise ValueError("El Client ID debe contener sólo números.")
-                if parsed_redirect.scheme != "https" or not parsed_redirect.hostname or parsed_redirect.username or parsed_redirect.password or parsed_redirect.query or parsed_redirect.fragment:
-                    raise ValueError("La Redirect URI debe ser una URL HTTPS fija, sin usuario, parámetros ni fragmento.")
-                with connect_db() as db:
-                    values = {"ml_client_id": client_id, "ml_redirect_uri": redirect_uri}
-                    if secret:
-                        values["ml_client_secret_encrypted"] = protect_secret(secret)
-                    elif not read_settings(db).get("ml_client_secret_encrypted"):
-                        raise ValueError("Ingresa el Client Secret para guardarlo cifrado en este equipo.")
-                    write_settings(db, values)
-                    status = market_automation_status(db)
-                self.send_json(status)
-                return
+                raise ValueError("Las credenciales de MercadoLibre se configuran en el archivo privado .env del backend.")
             if path == "/api/mercadolibre/auth-url":
                 with connect_db() as db:
                     self.send_json(create_ml_authorization(db))
@@ -1262,65 +1292,26 @@ class Handler(BaseHTTPRequestHandler):
                     ai_values = read_settings(db)
                 if product is None:
                     raise ValueError("Elige un producto del catálogo antes de analizar.")
-                if not str(payload.get("api_key", "")).strip():
-                    encrypted_key = ai_values.get("openai_api_key_encrypted", "")
-                    if not encrypted_key:
-                        raise ValueError("Guarda primero tu clave API de OpenAI en la configuración local.")
-                    payload["api_key"] = reveal_secret(encrypted_key)
-                if not str(payload.get("model", "")).strip():
-                    payload["model"] = ai_values.get("openai_model", "gpt-6-astra")
+                api_key, _ = configured_secret(ai_values, "OPENAI_API_KEY", "openai_api_key_encrypted")
+                if not api_key:
+                    raise ValueError("Configura IMPORTEX_OPENAI_API_KEY en el archivo privado .env del backend.")
+                # Never accept credentials from the browser, even if an old client sends them.
+                payload["api_key"] = api_key
+                payload["model"] = configured_value(ai_values, "OPENAI_MODEL", "openai_model", "gpt-6-astra")
                 payload["spec"] = product["spec"]
                 self.send_json(analyze_public_page(payload))
                 return
             if path == "/api/ai-config":
-                api_key = str(payload.get("api_key", "")).strip()
-                model = str(payload.get("model", "gpt-6-astra")).strip()[:120]
-                if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
-                    raise ValueError("El nombre del modelo contiene caracteres no admitidos.")
-                with connect_db() as db:
-                    values = {"openai_model": model}
-                    if api_key:
-                        if not api_key.startswith("sk-"):
-                            raise ValueError("La clave API no tiene el formato esperado de OpenAI.")
-                        values["openai_api_key_encrypted"] = protect_secret(api_key)
-                    write_settings(db, values)
-                    configured = bool(read_settings(db).get("openai_api_key_encrypted", ""))
-                self.send_json({"model": model, "configured": configured})
-                return
+                raise ValueError("La clave y el modelo de IA se configuran en el archivo privado .env del backend.")
             if path == "/api/chilecompra-config":
-                ticket = str(payload.get("ticket", "")).strip()[:300]
-                with connect_db() as db:
-                    values = {}
-                    if ticket:
-                        if len(ticket) < 12 or not re.fullmatch(r"[A-Za-z0-9-]+", ticket):
-                            raise ValueError("Revisa el ticket entregado por ChileCompra.")
-                        values["chilecompra_ticket_encrypted"] = protect_secret(ticket)
-                    elif not read_settings(db).get("chilecompra_ticket_encrypted"):
-                        raise ValueError("Ingresa el ticket de ChileCompra para guardarlo cifrado.")
-                    write_settings(db, values)
-                    status = get_chilecompra_status(db)
-                self.send_json(status)
-                return
+                raise ValueError("El ticket de ChileCompra se configura en el archivo privado .env del backend.")
             if path == "/api/bde-config":
-                token = str(payload.get("token", "")).strip()[:500]
-                with connect_db() as db:
-                    values = {}
-                    if token:
-                        if len(token) < 12 or any(ch.isspace() for ch in token):
-                            raise ValueError("Revisa el API Key Token del Banco Central.")
-                        values["bde_api_token_encrypted"] = protect_secret(token)
-                    elif not read_settings(db).get("bde_api_token_encrypted"):
-                        raise ValueError("Ingresa el API Key Token para guardarlo cifrado.")
-                    write_settings(db, values)
-                    configured = bool(read_settings(db).get("bde_api_token_encrypted"))
-                self.send_json({"configured": configured})
-                return
+                raise ValueError("El token del Banco Central se configura en el archivo privado .env del backend.")
             if path == "/api/chilecompra-check":
                 with connect_db() as db:
-                    encrypted = read_settings(db).get("chilecompra_ticket_encrypted", "")
-                if not encrypted:
+                    ticket, _ = configured_secret(read_settings(db), "CHILECOMPRA_API_TICKET", "chilecompra_ticket_encrypted")
+                if not ticket:
                     raise ValueError("Guarda primero el ticket de ChileCompra.")
-                ticket = reveal_secret(encrypted)
                 today = datetime.now().strftime("%d%m%Y")
                 query = urllib.parse.urlencode({"fecha": today, "ticket": ticket})
                 request = urllib.request.Request(
@@ -1449,9 +1440,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/exchange-rates/refresh":
                 rates = fetch_exchange_rates()
                 with connect_db() as db:
-                    saved = read_settings(db)
-                if saved.get("bde_api_token_encrypted"):
-                    bde_rate = fetch_bde_usd_clp(reveal_secret(saved["bde_api_token_encrypted"]))
+                    bde_token, _ = configured_secret(read_settings(db), "BDE_API_KEY_TOKEN", "bde_api_token_encrypted")
+                if bde_token:
+                    bde_rate = fetch_bde_usd_clp(bde_token)
                     rates["CLP"] = bde_rate
                 now = datetime.now().isoformat(timespec="minutes")
                 with connect_db() as db:

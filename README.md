@@ -67,3 +67,15 @@ Los datos estructurados quedan en `comercio.sqlite3`, dentro de esta carpeta. Ha
 El servidor escucha únicamente en `127.0.0.1` y limita las rutas locales a `localhost`/`127.0.0.1`. No publiques ni reenvíes este servidor a Internet. Las solicitudes de búsqueda de precio sólo deben apuntar a páginas públicas; también se vuelven a revisar los destinos de redirección y se permiten sólo los puertos web 80/443. Evita pegar enlaces que contengan sesiones o credenciales.
 
 Los archivos existentes bajo `sources/` pertenecen al espejo del proyecto y no se modificaron.
+
+## Credenciales privadas del backend
+
+Para una instalación personal, las claves de integraciones se cargan una vez en el backend, no desde la interfaz:
+
+1. Copia `.env.example` a `.env` dentro de esta carpeta.
+2. Completa únicamente las variables de servicios que tengas habilitados.
+3. Reinicia `python app.py` para que el servidor lea los cambios.
+
+Variables disponibles: `IMPORTEX_OPENAI_API_KEY` y `IMPORTEX_OPENAI_MODEL`, `IMPORTEX_BDE_API_KEY_TOKEN`, `IMPORTEX_CHILECOMPRA_API_TICKET` y `IMPORTEX_MERCADOLIBRE_CLIENT_ID`, `IMPORTEX_MERCADOLIBRE_CLIENT_SECRET`, `IMPORTEX_MERCADOLIBRE_REDIRECT_URI`. MercadoLibre mantiene sus tokens OAuth renovables cifrados en la base local; la interfaz conserva sólo la acción de autorización y el campo de código de retorno.
+
+El servidor nunca devuelve estos secretos al navegador. El archivo `.env` está excluido de Git. Las credenciales cifradas previamente en `comercio.sqlite3` siguen como respaldo para no cortar integraciones antiguas; cuando exista una variable del backend, ésta tiene prioridad. No publiques ni compartas el archivo `.env`.
