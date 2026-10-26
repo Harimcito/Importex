@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+comercio.sqlite3
+comercio.sqlite3-*
+.env
+.env.*
+!.env.example
+
