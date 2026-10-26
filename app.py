@@ -56,6 +56,10 @@ def init_db():
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, product TEXT NOT NULL DEFAULT '',
             inputs_json TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            currency TEXT PRIMARY KEY, units_per_usd REAL NOT NULL,
+            rate_date TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
         """)
         if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
             now = datetime.now().isoformat(timespec="minutes")
@@ -64,6 +68,34 @@ def init_db():
                 ("Resma oficio", "75 g/m² · 500 hojas", "resma", now),
                 ("Cuaderno universitario", "80 hojas · tapa dura", "unidad", now),
             ])
+        # Refine only the untouched starter catalog; keep any product that has observations.
+        db.execute("UPDATE products SET name='Resma Carta',spec='75 g/m² · 500 hojas · tamaño Carta' WHERE name='Resma A4'")
+        db.execute("UPDATE products SET name='Resma Oficio',spec='75 g/m² · 500 hojas · tamaño Oficio' WHERE name='Resma oficio'")
+        db.execute("""DELETE FROM products WHERE name='Cuaderno universitario'
+                    AND NOT EXISTS (SELECT 1 FROM quotes WHERE quotes.product=products.name)
+                    AND NOT EXISTS (SELECT 1 FROM market_prices WHERE market_prices.product=products.name)""")
+        for name, spec in (("Resma Carta", "75 g/m² · 500 hojas · tamaño Carta"),
+                           ("Resma Oficio", "75 g/m² · 500 hojas · tamaño Oficio")):
+            if not db.execute("SELECT 1 FROM products WHERE name=?", (name,)).fetchone():
+                db.execute("INSERT INTO products(name,spec,unit,created_at) VALUES(?,?,?,?)", (name, spec, "resma", datetime.now().isoformat(timespec="minutes")))
+
+
+def fetch_exchange_rates():
+    url = "https://api.frankfurter.dev/v2/rates?base=USD&quotes=CLP,CNY,BRL"
+    request = urllib.request.Request(url, headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.loads(response.read(200_000).decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("La fuente devolvió un formato inesperado.")
+    rates = {"USD": {"rate": 1.0, "date": datetime.now().date().isoformat()}}
+    for item in data:
+        code = item.get("quote")
+        rate = float(item.get("rate", 0))
+        if code in ("CLP", "CNY", "BRL") and rate > 0:
+            rates[code] = {"rate": rate, "date": str(item.get("date", ""))}
+    if not all(code in rates for code in ("CLP", "CNY", "BRL")):
+        raise ValueError("La fuente no entregó todas las monedas requeridas.")
+    return rates
 
 
 class PriceParser(HTMLParser):
@@ -409,6 +441,10 @@ class Handler(BaseHTTPRequestHandler):
                     row["result"] = json.loads(row.pop("result_json"))
                 self.send_json(rows)
                 return
+            if path == "/api/exchange-rates":
+                rows = [dict(r) for r in db.execute("SELECT currency,units_per_usd,rate_date,source,updated_at FROM exchange_rates ORDER BY currency")]
+                self.send_json(rows)
+                return
             if path == "/api/summary":
                 q = db.execute("SELECT COUNT(*) c FROM quotes").fetchone()["c"]
                 p = db.execute("SELECT COUNT(*) c FROM market_prices").fetchone()["c"]
@@ -441,6 +477,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/imap-scan":
                 self.send_json(scan_imap(payload))
+                return
+            if path == "/api/exchange-rates/refresh":
+                rates = fetch_exchange_rates()
+                now = datetime.now().isoformat(timespec="minutes")
+                with connect_db() as db:
+                    for currency, value in rates.items():
+                        db.execute("""INSERT INTO exchange_rates(currency,units_per_usd,rate_date,source,updated_at)
+                                    VALUES(?,?,?,?,?) ON CONFLICT(currency) DO UPDATE SET
+                                    units_per_usd=excluded.units_per_usd,rate_date=excluded.rate_date,
+                                    source=excluded.source,updated_at=excluded.updated_at""",
+                                   (currency, value["rate"], value["date"], "Frankfurter (tasas de referencia)", now))
+                    rows = [dict(r) for r in db.execute("SELECT currency,units_per_usd,rate_date,source,updated_at FROM exchange_rates ORDER BY currency")]
+                self.send_json(rows)
                 return
             with connect_db() as db:
                 if path == "/api/products":
@@ -503,4 +552,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
