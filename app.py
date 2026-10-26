@@ -52,6 +52,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS scenarios (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, product TEXT NOT NULL DEFAULT '',
+            inputs_json TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         """)
         if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
             now = datetime.now().isoformat(timespec="minutes")
@@ -95,20 +99,35 @@ class PriceParser(HTMLParser):
             self.parts.append(text)
 
 
-def safe_price_fetch(url):
+def validate_public_url(url):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("https", "http") or not parsed.hostname:
         raise ValueError("Usa un enlace público http/https.")
     if parsed.username or parsed.password:
         raise ValueError("No incluyas credenciales en el enlace.")
     try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))}
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if port not in (80, 443):
+            raise ValueError("Por seguridad sólo se permiten páginas públicas por los puertos web 80 y 443.")
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, port)}
         if not addresses or any(not ipaddress.ip_address(addr).is_global for addr in addresses):
             raise ValueError("Sólo se permiten páginas públicas de Internet.")
     except socket.gaierror as exc:
         raise ValueError("No pude resolver el dominio de esa página.") from exc
+
+
+class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def safe_price_fetch(url):
+    validate_public_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": "ComercioPriceCheck/1.0"})
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    opener = urllib.request.build_opener(PublicRedirectHandler())
+    with opener.open(req, timeout=12) as resp:
+        validate_public_url(resp.geturl())
         ctype = resp.headers.get("Content-Type", "")
         if "html" not in ctype.lower():
             raise ValueError("La dirección no devolvió una página HTML pública.")
@@ -348,10 +367,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def body_json(self):
-        length = min(int(self.headers.get("Content-Length", "0")), 5_000_000)
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 5_000_000:
+            raise ValueError("La solicitud supera el límite permitido de 5 MB.")
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def local_request_allowed(self):
+        allowed = {"127.0.0.1:8765", "localhost:8765"}
+        host = self.headers.get("Host", "").strip().lower()
+        origin = self.headers.get("Origin")
+        valid_origin = origin is None or origin.rstrip("/").lower() in {
+            "http://127.0.0.1:8765", "http://localhost:8765"
+        }
+        return host in allowed and valid_origin
+
     def do_GET(self):
+        if not self.local_request_allowed():
+            self.send_json({"error": "Acceso sólo desde este panel local."}, 403)
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/":
             file = ROOT / "static" / "index.html"
@@ -369,6 +402,13 @@ class Handler(BaseHTTPRequestHandler):
                 rows = [dict(r) for r in db.execute(f"SELECT * FROM {tables[path]} ORDER BY id DESC LIMIT 500")]
                 self.send_json(rows)
                 return
+            if path == "/api/scenarios":
+                rows = [dict(r) for r in db.execute("SELECT * FROM scenarios ORDER BY id DESC LIMIT 100")]
+                for row in rows:
+                    row["inputs"] = json.loads(row.pop("inputs_json"))
+                    row["result"] = json.loads(row.pop("result_json"))
+                self.send_json(rows)
+                return
             if path == "/api/summary":
                 q = db.execute("SELECT COUNT(*) c FROM quotes").fetchone()["c"]
                 p = db.execute("SELECT COUNT(*) c FROM market_prices").fetchone()["c"]
@@ -378,6 +418,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "No encontrado"}, 404)
 
     def do_POST(self):
+        if not self.local_request_allowed():
+            self.send_json({"error": "Acceso sólo desde este panel local."}, 403)
+            return
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self.body_json()
@@ -415,12 +458,37 @@ class Handler(BaseHTTPRequestHandler):
                         payload["seller"], payload["product"], float(payload["price"]), payload.get("currency", "CLP"),
                         payload.get("unit", "unidad"), payload.get("url", ""), datetime.now().isoformat(timespec="minutes"),
                         1 if payload.get("verified") else 0))
+                elif path == "/api/scenarios":
+                    name = str(payload.get("name", "")).strip()[:100]
+                    inputs = payload.get("inputs")
+                    result = payload.get("result")
+                    if not name or not isinstance(inputs, dict) or not isinstance(result, dict):
+                        raise ValueError("Escribe un nombre y calcula un escenario antes de guardarlo.")
+                    db.execute("INSERT INTO scenarios(name,product,inputs_json,result_json,created_at) VALUES(?,?,?,?,?)", (
+                        name, str(payload.get("product", ""))[:200],
+                        json.dumps(inputs, ensure_ascii=False), json.dumps(result, ensure_ascii=False),
+                        datetime.now().isoformat(timespec="minutes")))
                 else:
                     self.send_json({"error": "No encontrado"}, 404)
                     return
             self.send_json({"ok": True})
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
+
+    def do_DELETE(self):
+        if not self.local_request_allowed():
+            self.send_json({"error": "Acceso sólo desde este panel local."}, 403)
+            return
+        match = re.fullmatch(r"/api/scenarios/(\d+)", urllib.parse.urlparse(self.path).path)
+        if not match:
+            self.send_json({"error": "No encontrado"}, 404)
+            return
+        with connect_db() as db:
+            cursor = db.execute("DELETE FROM scenarios WHERE id=?", (int(match.group(1)),))
+            if not cursor.rowcount:
+                self.send_json({"error": "El escenario ya no existe."}, 404)
+                return
+        self.send_json({"ok": True})
 
 
 def main():

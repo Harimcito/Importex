@@ -20,7 +20,8 @@ Los datos estructurados quedan en `comercio.sqlite3`, dentro de esta carpeta. Ha
 - Registro de cotizaciones de proveedores, incluyendo MOQ, Incoterm y condiciones de pago.
 - Lectura IMAP SSL/TLS sólo al pulsar el botón, limitada a remitentes/dominios que el usuario autorice en la pantalla. Usa modo sólo lectura y `BODY.PEEK`; no marca mensajes como leídos ni los modifica. La contraseña se usa en esa conexión, se descarta al terminar y no se guarda en la base.
 - Importación de un archivo `.eml` seleccionado por el usuario; se proponen campos y sólo se guardan después de revisar y confirmar. El archivo original y el cuerpo del mensaje no se conservan.
-- Calculadora editable de CIF, arancel, IVA de importación, gastos locales, costo neto, contribución y equilibrio.
+- Calculadora editable de CIF, arancel, IVA de importación, gastos locales, costo neto, contribución y equilibrio. Permite indicar si el FOB está cotizado por unidad o por caja y convierte usando las unidades de la caja.
+- Guardado de múltiples escenarios de costos en SQLite, con sus supuestos completos para volver a abrirlos, compararlos y eliminarlos. Los escenarios quedan en el computador donde corre el panel.
 - Plantilla inicial de hitos y reinversión del 40% sobre utilidad cobrada.
 
 ## Límites actuales
@@ -35,7 +36,7 @@ Los datos estructurados quedan en `comercio.sqlite3`, dentro de esta carpeta. Ha
 
 ## Seguridad y uso
 
-El servidor escucha únicamente en `127.0.0.1`. No publiques ni reenvíes este servidor a Internet. Las solicitudes de búsqueda de precio sólo deben apuntar a páginas públicas. Evita pegar enlaces que contengan sesiones o credenciales.
+El servidor escucha únicamente en `127.0.0.1` y limita las rutas locales a `localhost`/`127.0.0.1`. No publiques ni reenvíes este servidor a Internet. Las solicitudes de búsqueda de precio sólo deben apuntar a páginas públicas; también se vuelven a revisar los destinos de redirección y se permiten sólo los puertos web 80/443. Evita pegar enlaces que contengan sesiones o credenciales.
 
 Los archivos existentes bajo `sources/` pertenecen al espejo del proyecto y no se modificaron.
 
