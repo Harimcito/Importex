@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import email
 import email.policy
+import csv
+import io
 import imaplib
 import ipaddress
 import json
 import re
+import secrets
+import smtplib
 import socket
 import ssl
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import date, datetime
 from email.parser import BytesParser
+from email.message import EmailMessage
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +30,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "comercio.sqlite3"
 PORT = 8765
+ML_REFRESH_LOCK = threading.Lock()
+IMAP_SCAN_LOCK = threading.Lock()
 
 
 def connect_db():
@@ -60,7 +69,19 @@ def init_db():
             currency TEXT PRIMARY KEY, units_per_usd REAL NOT NULL,
             rate_date TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS email_quote_reviews (
+            id INTEGER PRIMARY KEY, external_id TEXT NOT NULL UNIQUE,
+            sender TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+            message_date TEXT NOT NULL DEFAULT '', parsed_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', captured_at TEXT NOT NULL
+        );
         """)
+        price_columns = {row["name"] for row in db.execute("PRAGMA table_info(market_prices)")}
+        for column, definition in (("source_id", "TEXT"), ("title", "TEXT DEFAULT ''"),
+                                   ("collected_day", "TEXT DEFAULT ''"), ("quantity_note", "TEXT DEFAULT ''")):
+            if column not in price_columns:
+                db.execute(f"ALTER TABLE market_prices ADD COLUMN {column} {definition}")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_source_day ON market_prices(source_id,collected_day) WHERE source_id IS NOT NULL AND source_id<>''")
         if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
             now = datetime.now().isoformat(timespec="minutes")
             db.executemany("INSERT INTO products(name,spec,unit,created_at) VALUES(?,?,?,?)", [
@@ -80,6 +101,197 @@ def init_db():
                 db.execute("INSERT INTO products(name,spec,unit,created_at) VALUES(?,?,?,?)", (name, spec, "resma", datetime.now().isoformat(timespec="minutes")))
 
 
+def protect_secret(secret):
+    """Protect a secret with DPAPI; fall back to machine scope when the user profile is unavailable."""
+    if not secret:
+        return ""
+    if __import__("os").name != "nt":
+        raise ValueError("El guardado seguro de la clave de correo requiere Windows.")
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    raw = secret.encode("utf-8")
+    buf = ctypes.create_string_buffer(raw)
+    source = DataBlob(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+    target = DataBlob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [ctypes.POINTER(DataBlob), wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob)]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    scope = "user"
+    ok = crypt32.CryptProtectData(ctypes.byref(source), "Importex secreto local", None, None, None, 1, ctypes.byref(target))
+    if not ok:
+        # Codex may launch the local server under an isolated identity without the signed-in user's DPAPI profile.
+        # Machine scope still encrypts at rest but is decryptable by other local accounts that can read this DB.
+        ctypes.set_last_error(0)
+        target = DataBlob()
+        ok = crypt32.CryptProtectData(ctypes.byref(source), "Importex secreto local", None, None, None, 0x5, ctypes.byref(target))
+        scope = "machine"
+    if not ok:
+        raise OSError(ctypes.get_last_error(), "Windows no pudo cifrar el secreto local.")
+    try:
+        encoded = __import__("base64").b64encode(ctypes.string_at(target.pbData, target.cbData)).decode("ascii")
+        return ("DPAPI-USER:" if scope == "user" else "DPAPI-MACHINE:") + encoded
+    finally:
+        kernel32.LocalFree(target.pbData)
+
+
+def reveal_secret(encrypted):
+    if not encrypted:
+        return ""
+    if __import__("os").name != "nt":
+        raise ValueError("La clave guardada sólo puede descifrarse en el usuario de Windows que la configuró.")
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    scope = "legacy-user"
+    if encrypted.startswith("DPAPI-USER:"):
+        scope, encrypted = "user", encrypted[len("DPAPI-USER:"):]
+    elif encrypted.startswith("DPAPI-MACHINE:"):
+        scope, encrypted = "machine", encrypted[len("DPAPI-MACHINE:"):]
+    raw = __import__("base64").b64decode(encrypted.encode("ascii"))
+    buf = ctypes.create_string_buffer(raw)
+    source = DataBlob(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+    target = DataBlob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DataBlob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob)]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    if not crypt32.CryptUnprotectData(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)):
+        raise OSError(ctypes.get_last_error(), "Windows no pudo descifrar el secreto local.")
+    try:
+        return ctypes.string_at(target.pbData, target.cbData).decode("utf-8")
+    finally:
+        kernel32.LocalFree(target.pbData)
+
+
+def read_settings(db):
+    return {r["key"]: r["value"] for r in db.execute("SELECT key,value FROM settings")}
+
+
+def write_settings(db, values):
+    for key, value in values.items():
+        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def get_alert_config(db):
+    values = read_settings(db)
+    return {
+        "host": values.get("smtp_host", ""),
+        "port": int(values.get("smtp_port", "465")),
+        "security": values.get("smtp_security", "ssl"),
+        "username": values.get("smtp_username", ""),
+        "sender": values.get("smtp_sender", ""),
+        "recipient": values.get("smtp_recipient", ""),
+        "enabled": values.get("daily_alert_enabled", "0") == "1",
+        "time": values.get("daily_alert_time", "10:00"),
+        "configured": bool(values.get("smtp_password_encrypted", "")),
+        "last_sent": values.get("daily_alert_last_sent", ""),
+    }
+
+
+def get_imap_config(db):
+    values = read_settings(db)
+    return {
+        "host": values.get("imap_host", ""),
+        "port": int(values.get("imap_port", "993")),
+        "username": values.get("imap_username", ""),
+        "enabled": values.get("imap_daily_enabled", "0") == "1",
+        "time": values.get("imap_daily_time", "10:00"),
+        "configured": bool(values.get("imap_password_encrypted", "")),
+        "secret_scope": "machine" if values.get("imap_password_encrypted", "").startswith("DPAPI-MACHINE:") else "user",
+        "last_run": values.get("imap_daily_last_run", ""),
+        "last_status": values.get("imap_daily_last_status", "Aún no se ejecuta"),
+        "last_count": int(values.get("imap_daily_last_count", "0") or 0),
+    }
+
+
+def make_daily_digest(db, since):
+    prices = [dict(r) for r in db.execute(
+        "SELECT seller,product,price,currency,unit,url,observed_at,verified,title,quantity_note FROM market_prices WHERE observed_at>=? ORDER BY id DESC LIMIT 30", (since,))]
+    quotes = [dict(r) for r in db.execute(
+        "SELECT supplier,product,unit_price,currency,moq,incoterm,quote_date FROM quotes WHERE quote_date>=? ORDER BY id DESC LIMIT 30", (since[:10],))]
+    pending = [dict(r) for r in db.execute(
+        "SELECT sender,subject,parsed_json,captured_at FROM email_quote_reviews WHERE status='pending' AND captured_at>=? ORDER BY id DESC LIMIT 30", (since,))]
+    if not prices and not quotes and not pending:
+        return None
+    lines = ["Importex · resumen diario", "", "Nuevos datos guardados desde la última revisión:"]
+    if prices:
+        lines += ["", "Precios observados en Chile / mercado:"]
+        for item in prices:
+            lines.append(f"• {item['product']} — {item['price']:,.2f} {item['currency']} por {item['unit']}; {item['seller']} ({item['observed_at']})")
+            if item.get("title"):
+                lines.append(f"  Anuncio: {item['title']} · {'revisado' if item['verified'] else 'POR REVISAR'}; stock API: {item.get('quantity_note') or 'sin dato'}")
+            if item["url"]:
+                lines.append(f"  Fuente: {item['url']}")
+    if quotes:
+        lines += ["", "Cotizaciones de proveedores:"]
+        for item in quotes:
+            lines.append(f"• {item['product']} — {item['unit_price']:,.2f} {item['currency']} por unidad; {item['supplier']}; MOQ {item['moq']:g}; {item['incoterm'] or 'Incoterm pendiente'} ({item['quote_date']})")
+    if pending:
+        lines += ["", "Cotizaciones de correo pendientes de revisión:"]
+        for item in pending:
+            parsed = json.loads(item["parsed_json"])
+            amount = f"{parsed['unit_price']:,.2f} {parsed['currency']}" if parsed.get("unit_price") is not None else "precio no detectado"
+            lines.append(f"• {item['sender']} — {item['subject'] or 'sin asunto'} · {amount} · POR REVISAR ({item['captured_at']})")
+    lines += ["", "Revisa unidad, vigencia, flete, impuestos y margen en el panel antes de decidir. Este aviso no aprueba compras ni envía mensajes a proveedores."]
+    return "\n".join(lines)
+
+
+def send_email(config, encrypted_password, subject, body):
+    password = reveal_secret(encrypted_password)
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = config["sender"]
+    message["To"] = config["recipient"]
+    message.set_content(body)
+    timeout = 20
+    if config["security"] == "ssl":
+        with smtplib.SMTP_SSL(config["host"], config["port"], timeout=timeout, context=ssl.create_default_context()) as smtp:
+            smtp.login(config["username"], password)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(config["host"], config["port"], timeout=timeout) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+            smtp.login(config["username"], password)
+            smtp.send_message(message)
+
+
+def daily_alert_worker():
+    while True:
+        time.sleep(30)
+        try:
+            now = datetime.now()
+            day = now.date().isoformat()
+            with connect_db() as db:
+                config = get_alert_config(db)
+                values = read_settings(db)
+                encrypted = values.get("smtp_password_encrypted", "")
+                if not config["enabled"] or not config["configured"] or now.strftime("%H:%M") < config["time"] or config["last_sent"] == day:
+                    continue
+                digest = make_daily_digest(db, (now - __import__("datetime").timedelta(days=1)).isoformat(timespec="minutes"))
+                # Avoid sending an empty daily email. New data can be included in the next day's digest.
+                if not digest:
+                    continue
+            send_email(config, encrypted, "Importex: resumen diario de cotizaciones", digest)
+            with connect_db() as db:
+                write_settings(db, {"daily_alert_last_sent": day})
+        except Exception as exc:
+            print(f"No se pudo enviar el resumen diario: {str(exc)[:240]}")
+
+
 def fetch_exchange_rates():
     url = "https://api.frankfurter.dev/v2/rates?base=USD&quotes=CLP,CNY,BRL"
     request = urllib.request.Request(url, headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json"})
@@ -96,6 +308,293 @@ def fetch_exchange_rates():
     if not all(code in rates for code in ("CLP", "CNY", "BRL")):
         raise ValueError("La fuente no entregó todas las monedas requeridas.")
     return rates
+
+
+def fetch_bde_usd_clp(token):
+    """Fetch Banco Central observed USD/CLP without exposing its token in errors."""
+    params = urllib.parse.urlencode({
+        "token": token, "function": "GetSeries", "timeseries": "F073.TCO.PRE.Z.D",
+        "firstdate": (date.today() - __import__("datetime").timedelta(days=10)).isoformat(),
+        "lastdate": date.today().isoformat(),
+    })
+    request = urllib.request.Request(
+        "https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx?" + params,
+        headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read(300_000).decode("utf-8"))
+    except Exception as exc:
+        # Never echo the request URL: Banco Central requires the API token in its query string.
+        raise ValueError("No se pudo consultar la API del Banco Central. Revisa el token y vuelve a intentar.") from exc
+    if data.get("Codigo") != 0:
+        raise ValueError("Banco Central rechazó la consulta. Revisa que el token API esté habilitado.")
+    observations = (data.get("Series") or {}).get("Obs") or []
+    valid = []
+    for item in observations:
+        try:
+            value = float(item.get("value"))
+            if value > 0:
+                parsed_date = datetime.strptime(item["indexDateString"], "%d-%m-%Y").date().isoformat()
+                valid.append((parsed_date, value))
+        except (ValueError, TypeError, KeyError):
+            continue
+    if not valid:
+        raise ValueError("Banco Central no devolvió un valor reciente para el dólar observado.")
+    rate_date, rate = max(valid)
+    return {"rate": rate, "date": rate_date, "source": "Banco Central de Chile · dólar observado"}
+
+
+def get_chilecompra_status(db):
+    values = read_settings(db)
+    return {"configured": bool(values.get("chilecompra_ticket_encrypted", "")),
+            "last_check": values.get("chilecompra_last_check", ""),
+            "last_status": values.get("chilecompra_last_status", "Sin validar")}
+
+
+def post_json_endpoint(url, payload, headers=None, limit=500_000):
+    """Call a fixed, reviewed HTTPS API endpoint only after an explicit UI action."""
+    request_headers = {"User-Agent": "Importex-local/1.0", "Accept": "application/json",
+                      "Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                     headers=request_headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            raw = response.read(limit + 1)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2_000).decode("utf-8", errors="replace")
+        raise ValueError(f"La fuente respondió HTTP {exc.code}: {detail[:500]}") from exc
+    if len(raw) > limit:
+        raise ValueError("La respuesta de la fuente supera el tamaño permitido.")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("La fuente devolvió una respuesta que no es JSON válido.") from exc
+
+
+def comex_freight_quote(payload):
+    mode = str(payload.get("mode", "")).lower()
+    origin_country = str(payload.get("origin_country", "")).upper()
+    origin_city = str(payload.get("origin_city", "")).strip()[:100]
+    destination_city = str(payload.get("destination_city", "")).strip()[:100]
+    packages = payload.get("packages")
+    if mode not in ("auto", "courier", "air", "sea_lcl", "sea_fcl") or not origin_city or not destination_city:
+        raise ValueError("Completa origen, destino y modalidad de transporte.")
+    if origin_country not in ("CN", "BR", "US", "CL"):
+        raise ValueError("Selecciona un país de origen admitido.")
+    if destination_city.lower() != "arica":
+        raise ValueError("El destino de esta primera versión está fijado en Arica, Chile.")
+    if not isinstance(packages, list) or not 1 <= len(packages) <= 20:
+        raise ValueError("Añade entre 1 y 20 tipos de bulto.")
+    clean_packages = []
+    for row in packages:
+        item = {key: float(row.get(key, 0)) for key in ("qty", "length_cm", "width_cm", "height_cm", "weight_kg")}
+        if any(not __import__("math").isfinite(value) or value <= 0 for value in item.values()):
+            raise ValueError("Cantidad, dimensiones y peso deben ser mayores que cero.")
+        clean_packages.append(item)
+    api_payload = {"mode": mode, "origin_country": origin_country, "origin_city": origin_city,
+                   "destination_city": "Arica", "packages": clean_packages}
+    if payload.get("goods_value_usd") not in (None, ""):
+        value = float(payload["goods_value_usd"])
+        if not __import__("math").isfinite(value) or value < 0:
+            raise ValueError("El valor de mercancía debe ser un número positivo.")
+        api_payload["goods_value_usd"] = value
+    # Fixed first-party provider endpoint; user input never controls the request host or path.
+    return post_json_endpoint("https://comexchile.cl/api/v1/freight/quote", api_payload)
+
+
+def oauth_post(form):
+    request = urllib.request.Request(
+        "https://api.mercadolibre.com/oauth/token",
+        data=urllib.parse.urlencode(form).encode("utf-8"),
+        headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read(100_001)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1_500).decode("utf-8", errors="replace")
+        raise ValueError(f"MercadoLibre rechazó la autorización (HTTP {exc.code}): {detail[:400]}") from exc
+    if len(raw) > 100_000:
+        raise ValueError("Respuesta de autorización demasiado grande.")
+    return json.loads(raw.decode("utf-8"))
+
+
+def get_ml_access_token(db):
+    with ML_REFRESH_LOCK:
+        values = read_settings(db)
+        client_id = values.get("ml_client_id", "")
+        client_secret = values.get("ml_client_secret_encrypted", "")
+        access_encrypted = values.get("ml_access_token_encrypted", "")
+        refresh_encrypted = values.get("ml_refresh_token_encrypted", "")
+        expiry = int(values.get("ml_access_expires_at", "0") or 0)
+        if access_encrypted and expiry > int(time.time()) + 300:
+            return reveal_secret(access_encrypted)
+        if not all((client_id, client_secret, refresh_encrypted)):
+            raise ValueError("Conecta tu aplicación oficial de MercadoLibre antes de consultar.")
+        refreshed = oauth_post({"grant_type": "refresh_token", "client_id": client_id,
+                                "client_secret": reveal_secret(client_secret),
+                                "refresh_token": reveal_secret(refresh_encrypted)})
+        if not refreshed.get("access_token") or not refreshed.get("refresh_token"):
+            raise ValueError("MercadoLibre no devolvió tokens renovados; vuelve a autorizar la aplicación.")
+        write_settings(db, {"ml_access_token_encrypted": protect_secret(refreshed["access_token"]),
+                            "ml_refresh_token_encrypted": protect_secret(refreshed["refresh_token"]),
+                            "ml_access_expires_at": int(time.time()) + int(refreshed.get("expires_in", 21600)),
+                            "ml_user_id": refreshed.get("user_id", "")})
+        return refreshed["access_token"]
+
+
+def create_ml_authorization(db):
+    values = read_settings(db)
+    client_id = values.get("ml_client_id", "")
+    redirect_uri = values.get("ml_redirect_uri", "")
+    if not client_id or not redirect_uri:
+        raise ValueError("Guarda primero el Client ID y la Redirect URI de tu aplicación.")
+    state = secrets.token_urlsafe(24)
+    write_settings(db, {"ml_oauth_pending_state": state, "ml_oauth_pending_at": int(time.time())})
+    params = urllib.parse.urlencode({"response_type": "code", "client_id": client_id,
+                                     "redirect_uri": redirect_uri, "state": state})
+    return {"url": "https://auth.mercadolibre.cl/authorization?" + params, "state": state}
+
+
+def exchange_ml_authorization(db, code, state):
+    values = read_settings(db)
+    expected = values.get("ml_oauth_pending_state", "")
+    started = int(values.get("ml_oauth_pending_at", "0") or 0)
+    if not expected or not secrets.compare_digest(expected, state) or time.time() - started > 900:
+        raise ValueError("La autorización venció o no coincide. Inicia una nueva conexión.")
+    client_id, redirect_uri = values.get("ml_client_id", ""), values.get("ml_redirect_uri", "")
+    secret_encrypted = values.get("ml_client_secret_encrypted", "")
+    if not all((client_id, redirect_uri, secret_encrypted, code)):
+        raise ValueError("Falta el Client ID, Client Secret, código o Redirect URI.")
+    token_data = oauth_post({"grant_type": "authorization_code", "client_id": client_id,
+                             "client_secret": reveal_secret(secret_encrypted), "code": code,
+                             "redirect_uri": redirect_uri})
+    if not token_data.get("access_token") or not token_data.get("refresh_token"):
+        raise ValueError("MercadoLibre no devolvió los tokens esperados.")
+    write_settings(db, {"ml_access_token_encrypted": protect_secret(token_data["access_token"]),
+                        "ml_refresh_token_encrypted": protect_secret(token_data["refresh_token"]),
+                        "ml_access_expires_at": int(time.time()) + int(token_data.get("expires_in", 21600)),
+                        "ml_user_id": token_data.get("user_id", ""),
+                        "ml_oauth_pending_state": "", "ml_oauth_pending_at": ""})
+    return {"connected": True, "user_id": token_data.get("user_id")}
+
+
+def mercadolibre_search(payload, access_token):
+    query = str(payload.get("query", "")).strip()[:160]
+    if len(query) < 3:
+        raise ValueError("Escribe al menos 3 caracteres para buscar.")
+    params = urllib.parse.urlencode({"q": query, "limit": 20, "sort": "price_asc"})
+    url = "https://api.mercadolibre.com/sites/MLC/search?" + params
+    request = urllib.request.Request(url, headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json",
+                                                   "Authorization": "Bearer " + access_token})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read(1_000_001)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"MercadoLibre respondió HTTP {exc.code}. Puede limitar búsquedas automatizadas; vuelve a intentarlo más tarde.") from exc
+    if len(raw) > 1_000_000:
+        raise ValueError("La respuesta de MercadoLibre supera el tamaño permitido.")
+    data = json.loads(raw.decode("utf-8"))
+    rows = []
+    for item in data.get("results", [])[:20]:
+        permalink = str(item.get("permalink", ""))
+        parsed_link = urllib.parse.urlparse(permalink)
+        hostname = parsed_link.hostname or ""
+        if parsed_link.scheme != "https" or not (hostname == "mercadolibre.cl" or hostname.endswith(".mercadolibre.cl")):
+            permalink = ""
+        rows.append({"id": str(item.get("id", "")), "title": str(item.get("title", ""))[:300],
+                     "price": item.get("price"), "currency": item.get("currency_id", "CLP"),
+                     "url": permalink, "seller_id": (item.get("seller") or {}).get("id"),
+                     "condition": item.get("condition", ""), "available_quantity": item.get("available_quantity")})
+    return {"query": query, "source": "MercadoLibre Chile · API oficial", "results": rows}
+
+
+def market_automation_status(db):
+    values = read_settings(db)
+    return {"enabled": values.get("daily_market_enabled", "0") == "1",
+            "time": values.get("daily_market_time", "10:00"),
+            "connected": bool(values.get("ml_refresh_token_encrypted", "")),
+            "client_id": values.get("ml_client_id", ""),
+            "redirect_uri": values.get("ml_redirect_uri", "https://www.mercadolibre.cl"),
+            "last_run": values.get("daily_market_last_run", ""),
+            "last_status": values.get("daily_market_last_status", "Sin ejecución automática"),
+            "last_count": int(values.get("daily_market_last_count", "0") or 0),
+            "queries": json.loads(values.get("daily_market_queries", "[]"))}
+
+
+def collect_marketplace_prices():
+    day = datetime.now().date().isoformat()
+    with connect_db() as db:
+        values = read_settings(db)
+        queries = json.loads(values.get("daily_market_queries", "[]"))
+        if not queries:
+            raise ValueError("No hay búsquedas guardadas para la recolección diaria.")
+        access_token = get_ml_access_token(db)
+        total_saved = 0
+        warnings = []
+        for entry in queries[:10]:
+            product = str(entry.get("product", ""))[:200]
+            query = str(entry.get("query", "")).strip()[:160]
+            if not product or len(query) < 3:
+                warnings.append("Se omitió una búsqueda incompleta.")
+                continue
+            try:
+                results = mercadolibre_search({"query": query}, access_token)["results"]
+                for item in results:
+                    try:
+                        price = float(item.get("price"))
+                    except (TypeError, ValueError):
+                        continue
+                    if price <= 0 or not item.get("id"):
+                        continue
+                    db.execute("""INSERT INTO market_prices
+                        (seller,product,price,currency,unit,url,observed_at,verified,source_id,title,collected_day,quantity_note)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(source_id,collected_day) WHERE source_id IS NOT NULL AND source_id<>'' DO UPDATE SET seller=excluded.seller,
+                          product=excluded.product,price=excluded.price,currency=excluded.currency,
+                          unit=excluded.unit,url=excluded.url,observed_at=excluded.observed_at,
+                          verified=0,title=excluded.title,quantity_note=excluded.quantity_note""",
+                        ("MercadoLibre · vendedor " + str(item.get("seller_id") or "s/d"), product,
+                         price, str(item.get("currency") or "CLP"), "publicación · unidad por revisar",
+                         str(item.get("url") or ""), datetime.now().isoformat(timespec="minutes"), 0,
+                         str(item["id"]), str(item.get("title") or "")[:300], day,
+                         str(item.get("available_quantity") or "No informado")))
+                    total_saved += 1
+            except Exception as exc:
+                warnings.append(f"{product}: {str(exc)[:180]}")
+        status = "Guardado; revisar coincidencias" if total_saved else "No se encontraron precios válidos"
+        if warnings:
+            status += " · " + " | ".join(warnings[:3])
+        write_settings(db, {"daily_market_last_run": datetime.now().isoformat(timespec="minutes"),
+                            "daily_market_last_run_day": day, "daily_market_last_status": status,
+                            "daily_market_last_count": total_saved})
+    return {"saved": total_saved, "status": status}
+
+
+def daily_market_worker():
+    while True:
+        time.sleep(30)
+        try:
+            now = datetime.now()
+            day = now.date().isoformat()
+            with connect_db() as db:
+                config = market_automation_status(db)
+                values = read_settings(db)
+                if (not config["enabled"] or not config["connected"] or
+                        now.strftime("%H:%M") < config["time"] or
+                        values.get("daily_market_last_run_day") == day):
+                    continue
+            try:
+                collect_marketplace_prices()
+            except Exception as exc:
+                with connect_db() as db:
+                    write_settings(db, {"daily_market_last_run": datetime.now().isoformat(timespec="minutes"),
+                                        "daily_market_last_run_day": day,
+                                        "daily_market_last_status": str(exc)[:300], "daily_market_last_count": 0})
+        except Exception as exc:
+            print(f"No se pudo completar la recolección diaria: {str(exc)[:240]}")
 
 
 class PriceParser(HTMLParser):
@@ -262,6 +761,81 @@ def analyze_public_page(payload):
     return {"analysis": result, "model": response_data.get("model", model)}
 
 
+def extract_quote_attachment_text(msg):
+    snippets, filenames, issues = [], [], []
+    for part in msg.walk() if msg.is_multipart() else []:
+        filename = part.get_filename()
+        if part.get_content_disposition() != "attachment" and not filename:
+            continue
+        filename = str(filename or "adjunto")[:180]
+        filenames.append(filename)
+        raw = part.get_payload(decode=True) or b""
+        if not raw:
+            issues.append(f"{filename}: vacío o no legible")
+            continue
+        if len(raw) > 8_000_000:
+            issues.append(f"{filename}: supera el límite de 8 MB")
+            continue
+        suffix = Path(filename).suffix.lower()
+        try:
+            if suffix == ".pdf" or part.get_content_type() == "application/pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(raw), strict=False)
+                text = "\n".join((page.extract_text() or "") for page in reader.pages[:20])[:20_000]
+                if not text.strip():
+                    issues.append(f"{filename}: PDF sin texto extraíble (puede requerir OCR)")
+                else:
+                    snippets.append(text)
+            elif suffix in (".xlsx", ".xlsm"):
+                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                    members = archive.infolist()
+                    if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
+                        issues.append(f"{filename}: contenido comprimido excede el límite de seguridad")
+                        continue
+                from openpyxl import load_workbook
+                workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+                cells = []
+                for sheet in workbook.worksheets[:5]:
+                    for row in sheet.iter_rows(max_row=300, max_col=30, values_only=True):
+                        line = " | ".join(str(v).strip() for v in row if v is not None and str(v).strip())
+                        if line:
+                            cells.append(line)
+                        if sum(len(x) for x in cells) > 20_000:
+                            break
+                    if sum(len(x) for x in cells) > 20_000:
+                        break
+                workbook.close()
+                snippets.append("\n".join(cells)[:20_000])
+            elif suffix == ".xls":
+                import xlrd
+                workbook = xlrd.open_workbook(file_contents=raw, on_demand=True)
+                cells = []
+                for sheet in workbook.sheets()[:5]:
+                    for row_index in range(min(sheet.nrows, 300)):
+                        line = " | ".join(str(value).strip() for value in sheet.row_values(row_index)[:30] if str(value).strip())
+                        if line:
+                            cells.append(line)
+                        if sum(len(x) for x in cells) > 20_000:
+                            break
+                    if sum(len(x) for x in cells) > 20_000:
+                        break
+                workbook.release_resources()
+                snippets.append("\n".join(cells)[:20_000])
+            elif suffix == ".csv" or part.get_content_type() == "text/csv":
+                decoded = raw.decode("utf-8-sig", errors="replace")
+                rows = csv.reader(io.StringIO(decoded))
+                snippets.append("\n".join(" | ".join(row) for row in list(rows)[:500])[:20_000])
+            elif suffix in (".txt", ".text"):
+                snippets.append(raw.decode("utf-8", errors="replace")[:20_000])
+            else:
+                issues.append(f"{filename}: formato no procesado")
+        except ImportError:
+            issues.append(f"{filename}: falta instalar el lector requerido para {suffix or 'este formato'}")
+        except Exception:
+            issues.append(f"{filename}: no se pudo extraer texto")
+    return "\n".join(snippets), filenames, issues
+
+
 def parse_message(msg):
     body = []
     if msg.is_multipart():
@@ -278,7 +852,8 @@ def parse_message(msg):
             body.append(msg.get_content())
         except Exception:
             pass
-    text = "\n".join(str(x) for x in body)
+    attachment_text, attachment_names, attachment_issues = extract_quote_attachment_text(msg)
+    text = "\n".join(str(x) for x in body + ([attachment_text] if attachment_text else []))
     money = re.search(r"(?:US\$|USD\s*|CLP\s*\$?|\$|¥|￥)\s*([\d.,]+)", text, re.I)
     amount = None
     currency = "CLP"
@@ -314,6 +889,8 @@ def parse_message(msg):
         "payment_terms": payment_match.group(1).strip() if payment_match else "",
         "quote_date": date.today().isoformat(),
         "notes": "Importado desde .eml; revisar los campos antes de guardar.",
+        "attachments": attachment_names,
+        "attachment_issues": attachment_issues,
     }
 
 
@@ -322,59 +899,98 @@ def parse_eml(raw_text):
     return parse_message(msg)
 
 
-def scan_imap(payload):
+def scan_imap_incremental(payload, cursors=None, legacy_uid=None, legacy_uidvalidity=""):
+    """Read only new mail from INBOX and the Sent folder, without changing mailbox flags."""
     host = str(payload.get("host", "")).strip()
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
     port = int(payload.get("port", 993))
-    senders = [s.strip().lower() for s in payload.get("senders", []) if str(s).strip()]
-    limit = max(1, min(int(payload.get("limit", 20)), 50))
     if not host or not username or not password:
-        raise ValueError("Completa servidor, cuenta y contraseña en esta sesión.")
-    if not senders:
-        raise ValueError("Añade al menos un correo o dominio de proveedor autorizado. El buzón no se leerá sin ese filtro.")
-    if port != 993:
-        raise ValueError("Por seguridad esta primera conexión acepta sólo IMAP SSL/TLS por el puerto 993.")
-    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
-        raise ValueError("El servidor IMAP no parece válido.")
-    for sender in senders:
-        if sender.startswith("@"):
-            valid = re.fullmatch(r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", sender)
-        else:
-            valid = re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", sender)
-        if not valid:
-            raise ValueError(f"Filtro de remitente no válido: {sender}")
+        raise ValueError("Completa servidor, cuenta y contraseña en la configuración de correo.")
+    if port != 993 or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise ValueError("Configura un servidor válido con IMAP SSL/TLS en puerto 993.")
+    cursors = cursors if isinstance(cursors, dict) else {}
     connection = None
     found = []
+    updated_cursors = dict(cursors)
+    baseline_folders = []
     try:
-        connection = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=20)
+        connection = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=25)
         connection.login(username, password)
-        status, _ = connection.select("INBOX", readonly=True)
+        status, listed = connection.list()
         if status != "OK":
-            raise ValueError("No pude abrir INBOX en modo sólo lectura.")
-        seen_ids = set()
-        for sender in senders:
-            status, data = connection.search(None, "FROM", f'"{sender}"')
-            if status != "OK":
+            listed = []
+        folders = ["INBOX"]
+        sent_candidates = []
+        for entry in listed or []:
+            raw_entry = entry.decode("utf-8", errors="replace") if isinstance(entry, bytes) else str(entry)
+            match = re.search(r'\s+(?:"((?:[^"\\]|\\.)*)"|([^ ]+))\s*$', raw_entry)
+            if not match:
                 continue
-            ids = (data[0] or b"").split()[-limit:]
-            for msg_id in ids:
-                if msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-                status, parts = connection.fetch(msg_id, "(BODY.PEEK[])")
+            folder = (match.group(1) or match.group(2) or "").replace('\\"', '"').replace('\\\\', '\\')
+            lowered = raw_entry.lower() + " " + folder.lower()
+            if "\\sent" in lowered or "sent" in folder.lower() or "enviado" in folder.lower():
+                sent_candidates.append(folder)
+        sent_folder_found = bool(sent_candidates)
+        if sent_folder_found:
+            # Prefer the canonical Sent mailbox, otherwise use the server's first mailbox flagged as sent.
+            sent = next((f for f in sent_candidates if f.lower() in ("sent", "enviados", "sent mail", "sent items", "sent messages")), sent_candidates[0])
+            if sent.lower() != "inbox":
+                folders.append(sent)
+
+        for folder in folders:
+            status, _ = connection.select(folder, readonly=True)
+            if status != "OK":
+                if folder == "INBOX":
+                    raise ValueError("No pude abrir INBOX en modo sólo lectura.")
+                sent_folder_found = False
+                continue
+            uidvalidity_response = connection.response("UIDVALIDITY")
+            uidvalidity = ""
+            if uidvalidity_response and len(uidvalidity_response) > 1 and uidvalidity_response[1]:
+                uidvalidity = uidvalidity_response[1][0].decode("ascii", errors="ignore")
+            status, all_data = connection.uid("search", None, "ALL")
+            if status != "OK":
+                raise ValueError("El servidor no permitió consultar los identificadores del buzón.")
+            all_uids = [v for v in (all_data[0] or b"").split() if v.isdigit()]
+            max_uid = max((int(v) for v in all_uids), default=0)
+            old = cursors.get(folder)
+            if folder == "INBOX" and not old and legacy_uid is not None:
+                old = {"uid": int(legacy_uid), "uidvalidity": str(legacy_uidvalidity or "")}
+            changed = not old or (old.get("uidvalidity") and uidvalidity and old.get("uidvalidity") != uidvalidity)
+            if changed:
+                updated_cursors[folder] = {"uid": max_uid, "uidvalidity": uidvalidity}
+                baseline_folders.append(folder)
+                continue
+            after_uid = int(old.get("uid", 0))
+            status, uid_data = connection.uid("search", None, f"UID {max(1, after_uid + 1)}:*")
+            if status != "OK":
+                raise ValueError("No pude buscar los mensajes nuevos del buzón.")
+            message_uids = [v for v in (uid_data[0] or b"").split() if v.isdigit()]
+            has_more = len(message_uids) > 100
+            message_uids = message_uids[:100]
+            for uid in message_uids:
+                status, parts = connection.uid("fetch", uid, "(BODY.PEEK[])")
                 raw = next((part[1] for part in parts if isinstance(part, tuple) and isinstance(part[1], bytes)), None)
                 if status != "OK" or raw is None:
                     continue
                 msg = BytesParser(policy=email.policy.default).parsebytes(raw)
                 parsed = parse_message(msg)
                 parsed["notes"] = str(msg.get("Subject", ""))[:200]
+                parsed["mailbox_folder"] = folder
+                if parsed.get("attachments"):
+                    parsed["notes"] += " · Adjuntos: " + ", ".join(parsed["attachments"])
+                if parsed.get("attachment_issues"):
+                    parsed["notes"] += " · " + "; ".join(parsed["attachment_issues"])
                 parsed["message_date"] = str(msg.get("Date", ""))[:100]
+                parsed["uid"] = int(uid)
                 found.append(parsed)
-        found.sort(key=lambda item: item.get("message_date", ""), reverse=True)
-        return found[:limit]
+            cursor_uid = int(message_uids[-1]) if has_more and message_uids else max_uid
+            updated_cursors[folder] = {"uid": cursor_uid, "uidvalidity": uidvalidity}
+        return {"messages": found, "cursors": updated_cursors,
+                "baseline_folders": baseline_folders, "sent_folder_found": sent_folder_found}
     except imaplib.IMAP4.error as exc:
-        raise ValueError("El servidor rechazó el acceso IMAP. Revisa la contraseña y el estado del servicio IMAP.") from exc
+        raise ValueError("El servidor rechazó el acceso IMAP. Revisa la contraseña y que IMAP esté habilitado.") from exc
     except (OSError, ssl.SSLError) as exc:
         raise ValueError("No fue posible conectar con ese servidor IMAP SSL/TLS.") from exc
     finally:
@@ -383,6 +999,76 @@ def scan_imap(payload):
                 connection.logout()
             except Exception:
                 pass
+
+
+def collect_new_supplier_quotes(force=False):
+    if not IMAP_SCAN_LOCK.acquire(blocking=False):
+        return {"saved": 0, "status": "Ya hay una revisión del buzón en curso."}
+    try:
+        with connect_db() as db:
+            config = get_imap_config(db)
+            values = read_settings(db)
+            encrypted_password = values.get("imap_password_encrypted", "")
+            if (not force and not config["enabled"]) or not config["configured"]:
+                return {"saved": 0, "status": "La revisión está apagada o falta guardar la contraseña del buzón."}
+            try:
+                cursors = json.loads(values.get("imap_folder_cursors", "{}"))
+            except json.JSONDecodeError:
+                cursors = {}
+            result = scan_imap_incremental({**config, "password": reveal_secret(encrypted_password)}, cursors,
+                                           int(values["imap_last_uid"]) if values.get("imap_last_uid") else None,
+                                           values.get("imap_uidvalidity", ""))
+            now = datetime.now().isoformat(timespec="minutes")
+            saved = 0
+            for item in result["messages"]:
+                folder = item.get("mailbox_folder", "INBOX")
+                cursor = result["cursors"].get(folder, {})
+                external_id = f"{config['username']}:{folder}:{cursor.get('uidvalidity','')}:{item['uid']}"
+                cursor = db.execute("""INSERT OR IGNORE INTO email_quote_reviews
+                    (external_id,sender,subject,message_date,parsed_json,status,captured_at)
+                    VALUES(?,?,?,?,?,'pending',?)""",
+                    (external_id, item["sender"], item.get("notes", ""), item.get("message_date", ""),
+                     json.dumps(item, ensure_ascii=False), now))
+                saved += cursor.rowcount
+            inbox_cursor = result["cursors"].get("INBOX", {})
+            write_settings(db, {"imap_folder_cursors": json.dumps(result["cursors"], ensure_ascii=False),
+                                "imap_last_uid": inbox_cursor.get("uid", 0),
+                                "imap_uidvalidity": inbox_cursor.get("uidvalidity", ""),
+                                "imap_daily_last_run": now,
+                                "imap_daily_last_count": saved,
+                                "imap_daily_last_status": (
+                                    "Punto de partida guardado; los mensajes antiguos no se importaron. "
+                                    + ("No encontré una carpeta Enviados; se revisó sólo INBOX. " if not result["sent_folder_found"] else "Se detectaron Entrada y Enviados. ")
+                                    if result["baseline_folders"] and saved == 0 else
+                                    f"{saved} correo(s) nuevo(s) guardado(s) para revisar. "
+                                    + ("No encontré una carpeta Enviados; se revisó sólo INBOX." if not result["sent_folder_found"] else "Entrada y Enviados revisados.")
+                                )})
+            return {"saved": saved, "baseline": bool(result["baseline_folders"]) and saved == 0,
+                    "baseline_folders": result["baseline_folders"],
+                    "sent_folder_found": result["sent_folder_found"]}
+    finally:
+        IMAP_SCAN_LOCK.release()
+
+
+def daily_imap_worker():
+    while True:
+        time.sleep(30)
+        try:
+            now = datetime.now()
+            today = now.date().isoformat()
+            with connect_db() as db:
+                config = get_imap_config(db)
+                if (not config["enabled"] or not config["configured"] or
+                        now.strftime("%H:%M") < config["time"] or config["last_run"].startswith(today)):
+                    continue
+            collect_new_supplier_quotes()
+        except Exception as exc:
+            message = str(exc)[:240]
+            with connect_db() as db:
+                now = datetime.now().isoformat(timespec="minutes")
+                write_settings(db, {"imap_daily_last_run": now,
+                                    "imap_daily_last_status": "Falló la revisión automática: " + message})
+            print(f"No se pudo revisar el buzón de proveedores: {message}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -428,6 +1114,20 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        static_assets = {
+            "/assets/app.css": (ROOT / "static" / "app.css", "text/css; charset=utf-8"),
+            "/assets/app.js": (ROOT / "static" / "app.js", "text/javascript; charset=utf-8"),
+        }
+        if path in static_assets:
+            file, content_type = static_assets[path]
+            data = file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         with connect_db() as db:
             tables = {"/api/products": "products", "/api/quotes": "quotes", "/api/prices": "market_prices"}
             if path in tables:
@@ -451,6 +1151,33 @@ class Handler(BaseHTTPRequestHandler):
                 pr = db.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
                 self.send_json({"quotes": q, "prices": p, "products": pr})
                 return
+            if path == "/api/alerts":
+                self.send_json(get_alert_config(db))
+                return
+            if path == "/api/market-automation":
+                self.send_json(market_automation_status(db))
+                return
+            if path == "/api/imap-config":
+                self.send_json(get_imap_config(db))
+                return
+            if path == "/api/ai-config":
+                values = read_settings(db)
+                self.send_json({"model": values.get("openai_model", "gpt-6-astra"),
+                                "configured": bool(values.get("openai_api_key_encrypted", ""))})
+                return
+            if path == "/api/chilecompra-config":
+                self.send_json(get_chilecompra_status(db))
+                return
+            if path == "/api/bde-config":
+                values = read_settings(db)
+                self.send_json({"configured": bool(values.get("bde_api_token_encrypted", ""))})
+                return
+            if path == "/api/email-reviews":
+                rows = [dict(r) for r in db.execute("SELECT id,sender,subject,message_date,parsed_json,status,captured_at FROM email_quote_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
+                for row in rows:
+                    row["parsed"] = json.loads(row.pop("parsed_json"))
+                self.send_json(rows)
+                return
         self.send_json({"error": "No encontrado"}, 404)
 
     def do_POST(self):
@@ -460,6 +1187,71 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self.body_json()
+            if path == "/api/mercadolibre/config":
+                client_id = str(payload.get("client_id", "")).strip()[:30]
+                secret = str(payload.get("client_secret", ""))
+                redirect_uri = str(payload.get("redirect_uri", "")).strip()[:500]
+                parsed_redirect = urllib.parse.urlparse(redirect_uri)
+                if not re.fullmatch(r"\d{1,20}", client_id):
+                    raise ValueError("El Client ID debe contener sólo números.")
+                if parsed_redirect.scheme != "https" or not parsed_redirect.hostname or parsed_redirect.username or parsed_redirect.password or parsed_redirect.query or parsed_redirect.fragment:
+                    raise ValueError("La Redirect URI debe ser una URL HTTPS fija, sin usuario, parámetros ni fragmento.")
+                with connect_db() as db:
+                    values = {"ml_client_id": client_id, "ml_redirect_uri": redirect_uri}
+                    if secret:
+                        values["ml_client_secret_encrypted"] = protect_secret(secret)
+                    elif not read_settings(db).get("ml_client_secret_encrypted"):
+                        raise ValueError("Ingresa el Client Secret para guardarlo cifrado en este equipo.")
+                    write_settings(db, values)
+                    status = market_automation_status(db)
+                self.send_json(status)
+                return
+            if path == "/api/mercadolibre/auth-url":
+                with connect_db() as db:
+                    self.send_json(create_ml_authorization(db))
+                return
+            if path == "/api/mercadolibre/exchange":
+                with connect_db() as db:
+                    result = exchange_ml_authorization(db, str(payload.get("code", "")).strip(),
+                                                       str(payload.get("state", "")).strip())
+                self.send_json(result)
+                return
+            if path == "/api/market-automation/config":
+                schedule = str(payload.get("time", "10:00"))
+                enabled = bool(payload.get("enabled", False))
+                queries = payload.get("queries", [])
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule):
+                    raise ValueError("La hora debe tener formato 24 horas, por ejemplo 10:00.")
+                if not isinstance(queries, list) or not 1 <= len(queries) <= 10:
+                    raise ValueError("Guarda entre 1 y 10 búsquedas de productos.")
+                clean_queries = []
+                with connect_db() as db:
+                    for entry in queries:
+                        product = str(entry.get("product", "")).strip()[:200]
+                        query = str(entry.get("query", "")).strip()[:160]
+                        if len(query) < 3 or not db.execute("SELECT 1 FROM products WHERE name=?", (product,)).fetchone():
+                            raise ValueError("Cada búsqueda requiere un producto del catálogo y al menos 3 caracteres.")
+                        clean_queries.append({"product": product, "query": query})
+                    if enabled and not read_settings(db).get("ml_refresh_token_encrypted"):
+                        raise ValueError("Autoriza primero tu aplicación de MercadoLibre antes de activar la recolección.")
+                    write_settings(db, {"daily_market_enabled": "1" if enabled else "0",
+                                        "daily_market_time": schedule,
+                                        "daily_market_queries": json.dumps(clean_queries, ensure_ascii=False)})
+                    result = market_automation_status(db)
+                self.send_json(result)
+                return
+            if path == "/api/market-automation/run-now":
+                self.send_json(collect_marketplace_prices())
+                return
+            if path == "/api/comex/freight-quote":
+                self.send_json(comex_freight_quote(payload))
+                return
+            if path == "/api/mercadolibre/search":
+                with connect_db() as db:
+                    token = get_ml_access_token(db)
+                    result = mercadolibre_search(payload, token)
+                self.send_json(result)
+                return
             if path == "/api/price-check":
                 self.send_json(safe_price_fetch(str(payload.get("url", ""))))
                 return
@@ -467,19 +1259,200 @@ class Handler(BaseHTTPRequestHandler):
                 product_name = str(payload.get("product", ""))
                 with connect_db() as db:
                     product = db.execute("SELECT name,spec FROM products WHERE name=?", (product_name,)).fetchone()
+                    ai_values = read_settings(db)
                 if product is None:
                     raise ValueError("Elige un producto del catálogo antes de analizar.")
+                if not str(payload.get("api_key", "")).strip():
+                    encrypted_key = ai_values.get("openai_api_key_encrypted", "")
+                    if not encrypted_key:
+                        raise ValueError("Guarda primero tu clave API de OpenAI en la configuración local.")
+                    payload["api_key"] = reveal_secret(encrypted_key)
+                if not str(payload.get("model", "")).strip():
+                    payload["model"] = ai_values.get("openai_model", "gpt-6-astra")
                 payload["spec"] = product["spec"]
                 self.send_json(analyze_public_page(payload))
+                return
+            if path == "/api/ai-config":
+                api_key = str(payload.get("api_key", "")).strip()
+                model = str(payload.get("model", "gpt-6-astra")).strip()[:120]
+                if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
+                    raise ValueError("El nombre del modelo contiene caracteres no admitidos.")
+                with connect_db() as db:
+                    values = {"openai_model": model}
+                    if api_key:
+                        if not api_key.startswith("sk-"):
+                            raise ValueError("La clave API no tiene el formato esperado de OpenAI.")
+                        values["openai_api_key_encrypted"] = protect_secret(api_key)
+                    write_settings(db, values)
+                    configured = bool(read_settings(db).get("openai_api_key_encrypted", ""))
+                self.send_json({"model": model, "configured": configured})
+                return
+            if path == "/api/chilecompra-config":
+                ticket = str(payload.get("ticket", "")).strip()[:300]
+                with connect_db() as db:
+                    values = {}
+                    if ticket:
+                        if len(ticket) < 12 or not re.fullmatch(r"[A-Za-z0-9-]+", ticket):
+                            raise ValueError("Revisa el ticket entregado por ChileCompra.")
+                        values["chilecompra_ticket_encrypted"] = protect_secret(ticket)
+                    elif not read_settings(db).get("chilecompra_ticket_encrypted"):
+                        raise ValueError("Ingresa el ticket de ChileCompra para guardarlo cifrado.")
+                    write_settings(db, values)
+                    status = get_chilecompra_status(db)
+                self.send_json(status)
+                return
+            if path == "/api/bde-config":
+                token = str(payload.get("token", "")).strip()[:500]
+                with connect_db() as db:
+                    values = {}
+                    if token:
+                        if len(token) < 12 or any(ch.isspace() for ch in token):
+                            raise ValueError("Revisa el API Key Token del Banco Central.")
+                        values["bde_api_token_encrypted"] = protect_secret(token)
+                    elif not read_settings(db).get("bde_api_token_encrypted"):
+                        raise ValueError("Ingresa el API Key Token para guardarlo cifrado.")
+                    write_settings(db, values)
+                    configured = bool(read_settings(db).get("bde_api_token_encrypted"))
+                self.send_json({"configured": configured})
+                return
+            if path == "/api/chilecompra-check":
+                with connect_db() as db:
+                    encrypted = read_settings(db).get("chilecompra_ticket_encrypted", "")
+                if not encrypted:
+                    raise ValueError("Guarda primero el ticket de ChileCompra.")
+                ticket = reveal_secret(encrypted)
+                today = datetime.now().strftime("%d%m%Y")
+                query = urllib.parse.urlencode({"fecha": today, "ticket": ticket})
+                request = urllib.request.Request(
+                    "https://api.mercadopublico.cl/servicios/v1/publico/licitaciones.json?" + query,
+                    headers={"User-Agent": "Importex-local/1.0", "Accept": "application/json"})
+                try:
+                    with urllib.request.urlopen(request, timeout=20) as response:
+                        result = json.loads(response.read(1_000_000).decode("utf-8"))
+                except Exception as exc:
+                    # ChileCompra's documented API requires its ticket in the URL; keep it out of errors/logs.
+                    with connect_db() as db:
+                        write_settings(db, {"chilecompra_last_check": datetime.now().isoformat(timespec="minutes"),
+                                            "chilecompra_last_status": "No fue posible validar. Revisa el ticket o inténtalo más tarde."})
+                    raise ValueError("No se pudo validar el ticket con ChileCompra. Revisa que esté activo e intenta de nuevo.") from exc
+                if not isinstance(result, dict) or ("Listado" not in result and "Cantidad" not in result):
+                    raise ValueError("La respuesta de ChileCompra no tiene el formato esperado.")
+                count = result.get("Cantidad", len(result.get("Listado") or []))
+                status_text = f"Conexión válida · {count} licitación(es) publicadas hoy."
+                with connect_db() as db:
+                    write_settings(db, {"chilecompra_last_check": datetime.now().isoformat(timespec="minutes"),
+                                        "chilecompra_last_status": status_text})
+                    status = get_chilecompra_status(db)
+                self.send_json(status)
                 return
             if path == "/api/email-parse":
                 self.send_json(parse_eml(str(payload.get("raw", ""))))
                 return
-            if path == "/api/imap-scan":
-                self.send_json(scan_imap(payload))
+            if path == "/api/imap-config":
+                host = str(payload.get("host", "")).strip()[:253]
+                username = str(payload.get("username", "")).strip()[:254]
+                port = int(payload.get("port", 993))
+                schedule = str(payload.get("time", "10:00"))
+                enabled = bool(payload.get("enabled", False))
+                password = str(payload.get("password", ""))
+                if not re.fullmatch(r"[A-Za-z0-9.-]+", host) or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", username):
+                    raise ValueError("Revisa el servidor y la dirección de correo IMAP.")
+                if port != 993 or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule):
+                    raise ValueError("Usa IMAP SSL/TLS puerto 993 y una hora válida en formato 24 horas.")
+                with connect_db() as db:
+                    old = read_settings(db)
+                    if enabled and not (password or old.get("imap_password_encrypted")):
+                        raise ValueError("Ingresa la contraseña IMAP en el panel antes de activar el horario.")
+                    values = {"imap_host": host, "imap_port": port, "imap_username": username,
+                              "imap_daily_time": schedule, "imap_daily_enabled": "1" if enabled else "0"}
+                    if password:
+                        values["imap_password_encrypted"] = protect_secret(password)
+                    if not old.get("imap_folder_cursors") and not old.get("imap_last_uid"):
+                        values["imap_daily_last_run"] = ""
+                    write_settings(db, values)
+                    config = get_imap_config(db)
+                self.send_json(config)
+                return
+            if path == "/api/imap-scan-now":
+                result = collect_new_supplier_quotes(force=True)
+                with connect_db() as db:
+                    result["reviews"] = [dict(r) for r in db.execute("SELECT id,sender,subject,message_date,parsed_json,status,captured_at FROM email_quote_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
+                    for row in result["reviews"]:
+                        row["parsed"] = json.loads(row.pop("parsed_json"))
+                self.send_json(result)
+                return
+            review_match = re.fullmatch(r"/api/email-reviews/(\d+)/(approve|ignore)", path)
+            if review_match:
+                review_id, action = int(review_match.group(1)), review_match.group(2)
+                with connect_db() as db:
+                    row = db.execute("SELECT * FROM email_quote_reviews WHERE id=?", (review_id,)).fetchone()
+                    if row is None or row["status"] != "pending":
+                        raise ValueError("La cotización ya no está pendiente de revisión.")
+                    if action == "ignore":
+                        db.execute("UPDATE email_quote_reviews SET status='ignored' WHERE id=?", (review_id,))
+                        self.send_json({"ok": True})
+                        return
+                    supplier = str(payload.get("supplier", row["sender"])).strip()[:254]
+                    product = str(payload.get("product", "")).strip()[:200]
+                    unit_price = float(payload.get("unit_price", 0))
+                    currency = str(payload.get("currency", "USD")).upper()
+                    parsed = json.loads(row["parsed_json"])
+                    if not supplier or not product or unit_price <= 0 or currency not in ("USD", "CNY", "CLP", "BRL"):
+                        raise ValueError("Confirma proveedor, producto, precio mayor a cero y moneda antes de guardar.")
+                    notes = str(payload.get("notes", "")).strip()[:2000]
+                    db.execute("""INSERT INTO quotes(supplier,product,unit_price,currency,moq,incoterm,payment_terms,source_url,quote_date,notes)
+                                VALUES(?,?,?,?,?,?,?,?,?,?)""", (supplier, product, unit_price, currency,
+                                float(payload.get("moq", parsed.get("moq", 0)) or 0),
+                                str(payload.get("incoterm", parsed.get("incoterm", "")))[:20],
+                                str(payload.get("payment_terms", parsed.get("payment_terms", "")))[:200],
+                                "", date.today().isoformat(), notes + " · revisado desde cotización de correo"))
+                    db.execute("UPDATE email_quote_reviews SET status='approved' WHERE id=?", (review_id,))
+                self.send_json({"ok": True})
+                return
+            if path == "/api/alerts/config":
+                host = str(payload.get("host", "")).strip()[:253]
+                username = str(payload.get("username", "")).strip()[:254]
+                sender = str(payload.get("sender", "")).strip()[:254]
+                recipient = str(payload.get("recipient", "")).strip()[:254]
+                security = str(payload.get("security", "ssl"))
+                schedule = str(payload.get("time", "10:00"))
+                port = int(payload.get("port", 465))
+                enabled = bool(payload.get("enabled", False))
+                password = str(payload.get("password", ""))
+                if not re.fullmatch(r"[A-Za-z0-9.-]+", host) or not all(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", x) for x in (username, sender, recipient)):
+                    raise ValueError("Revisa el servidor y las direcciones de correo.")
+                if port not in (465, 587) or security not in ("ssl", "starttls") or (port == 465 and security != "ssl") or (port == 587 and security != "starttls"):
+                    raise ValueError("Usa puerto 465 con SSL o puerto 587 con STARTTLS.")
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule):
+                    raise ValueError("La hora debe tener formato 24 horas, por ejemplo 10:00.")
+                with connect_db() as db:
+                    values = {"smtp_host": host, "smtp_port": port, "smtp_security": security,
+                              "smtp_username": username, "smtp_sender": sender, "smtp_recipient": recipient,
+                              "daily_alert_enabled": "1" if enabled else "0", "daily_alert_time": schedule}
+                    if password:
+                        values["smtp_password_encrypted"] = protect_secret(password)
+                    elif not read_settings(db).get("smtp_password_encrypted"):
+                        raise ValueError("Ingresa la contraseña de correo para guardar la configuración.")
+                    write_settings(db, values)
+                    config = get_alert_config(db)
+                self.send_json(config)
+                return
+            if path == "/api/alerts/test":
+                with connect_db() as db:
+                    config = get_alert_config(db)
+                    encrypted = read_settings(db).get("smtp_password_encrypted", "")
+                if not config["configured"] or not config["recipient"]:
+                    raise ValueError("Guarda primero la configuración del correo.")
+                send_email(config, encrypted, "Importex: prueba de alertas", "El envío de prueba fue solicitado desde tu panel local. Si recibiste este mensaje, la conexión está lista. No se realizó ninguna compra ni se contactó a proveedores.")
+                self.send_json({"ok": True})
                 return
             if path == "/api/exchange-rates/refresh":
                 rates = fetch_exchange_rates()
+                with connect_db() as db:
+                    saved = read_settings(db)
+                if saved.get("bde_api_token_encrypted"):
+                    bde_rate = fetch_bde_usd_clp(reveal_secret(saved["bde_api_token_encrypted"]))
+                    rates["CLP"] = bde_rate
                 now = datetime.now().isoformat(timespec="minutes")
                 with connect_db() as db:
                     for currency, value in rates.items():
@@ -487,7 +1460,7 @@ class Handler(BaseHTTPRequestHandler):
                                     VALUES(?,?,?,?,?) ON CONFLICT(currency) DO UPDATE SET
                                     units_per_usd=excluded.units_per_usd,rate_date=excluded.rate_date,
                                     source=excluded.source,updated_at=excluded.updated_at""",
-                                   (currency, value["rate"], value["date"], "Frankfurter (tasas de referencia)", now))
+                                   (currency, value["rate"], value["date"], value.get("source", "Frankfurter (tasas de referencia)"), now))
                     rows = [dict(r) for r in db.execute("SELECT currency,units_per_usd,rate_date,source,updated_at FROM exchange_rates ORDER BY currency")]
                 self.send_json(rows)
                 return
@@ -542,8 +1515,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    threading.Thread(target=daily_alert_worker, name="daily-email-alerts", daemon=True).start()
+    threading.Thread(target=daily_imap_worker, name="daily-imap-quotes", daemon=True).start()
+    threading.Thread(target=daily_market_worker, name="daily-market-collection", daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Panel Comercio disponible en http://127.0.0.1:{PORT}")
+    print(f"Panel Importex disponible en http://127.0.0.1:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
