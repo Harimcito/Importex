@@ -68,12 +68,23 @@ def configured_secret(values, env_name, db_key):
         return env_value, "backend"
     encrypted = values.get(db_key, "")
     if encrypted:
-        return reveal_secret(encrypted), "local_encrypted"
+        try:
+            return reveal_secret(encrypted), "local_encrypted"
+        except OSError:
+            # DPAPI secrets may not be portable across Windows profiles or machines.
+            return "", "unavailable"
     return "", "missing"
 
 
 def configured_value(values, env_name, db_key, default=""):
     return private_setting(env_name) or values.get(db_key, default)
+
+
+def configured_secret_status(values, env_name, db_key):
+    if private_setting(env_name):
+        return True, "backend"
+    secret, source = configured_secret(values, env_name, db_key)
+    return bool(secret), source
 
 
 def connect_db():
@@ -388,8 +399,8 @@ def fetch_bde_usd_clp(token):
 
 def get_chilecompra_status(db):
     values = read_settings(db)
-    _, source = configured_secret(values, "CHILECOMPRA_API_TICKET", "chilecompra_ticket_encrypted")
-    return {"configured": source != "missing", "credential_source": source,
+    configured, source = configured_secret_status(values, "CHILECOMPRA_API_TICKET", "chilecompra_ticket_encrypted")
+    return {"configured": configured, "credential_source": source,
             "last_check": values.get("chilecompra_last_check", ""),
             "last_status": values.get("chilecompra_last_status", "Sin validar")}
 
@@ -559,10 +570,11 @@ def market_automation_status(db):
     values = read_settings(db)
     client_id = configured_value(values, "MERCADOLIBRE_CLIENT_ID", "ml_client_id")
     redirect_uri = configured_value(values, "MERCADOLIBRE_REDIRECT_URI", "ml_redirect_uri", "https://www.mercadolibre.cl")
+    app_secret, _ = configured_secret_status(values, "MERCADOLIBRE_CLIENT_SECRET", "ml_client_secret_encrypted")
     return {"enabled": values.get("daily_market_enabled", "0") == "1",
             "time": values.get("daily_market_time", "10:00"),
             "connected": bool(values.get("ml_refresh_token_encrypted", "")),
-            "app_configured": bool(client_id and configured_secret(values, "MERCADOLIBRE_CLIENT_SECRET", "ml_client_secret_encrypted")[0]),
+            "app_configured": bool(client_id and app_secret),
             "last_run": values.get("daily_market_last_run", ""),
             "last_status": values.get("daily_market_last_status", "Sin ejecución automática"),
             "last_count": int(values.get("daily_market_last_count", "0") or 0),
@@ -1207,17 +1219,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-config":
                 values = read_settings(db)
-                _, source = configured_secret(values, "OPENAI_API_KEY", "openai_api_key_encrypted")
+                configured, source = configured_secret_status(values, "OPENAI_API_KEY", "openai_api_key_encrypted")
                 self.send_json({"model": configured_value(values, "OPENAI_MODEL", "openai_model", "gpt-6-astra"),
-                                "configured": source != "missing", "credential_source": source})
+                                "configured": configured, "credential_source": source})
                 return
             if path == "/api/chilecompra-config":
                 self.send_json(get_chilecompra_status(db))
                 return
             if path == "/api/bde-config":
                 values = read_settings(db)
-                _, source = configured_secret(values, "BDE_API_KEY_TOKEN", "bde_api_token_encrypted")
-                self.send_json({"configured": source != "missing", "credential_source": source})
+                configured, source = configured_secret_status(values, "BDE_API_KEY_TOKEN", "bde_api_token_encrypted")
+                self.send_json({"configured": configured, "credential_source": source})
                 return
             if path == "/api/email-reviews":
                 rows = [dict(r) for r in db.execute("SELECT id,sender,subject,message_date,parsed_json,status,captured_at FROM email_quote_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
