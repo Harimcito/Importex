@@ -3,6 +3,7 @@ from __future__ import annotations
 import email
 import email.policy
 import csv
+import base64
 import io
 import imaplib
 import ipaddress
@@ -20,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime
 from email.parser import BytesParser
 from email.message import EmailMessage
@@ -218,6 +220,11 @@ def init_db():
             sender TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
             message_date TEXT NOT NULL DEFAULT '', parsed_json TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending', captured_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS supplier_document_reviews (
+            id INTEGER PRIMARY KEY, filename TEXT NOT NULL, parsed_json TEXT NOT NULL,
+            extracted_text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+            captured_at TEXT NOT NULL
         );
         """)
         price_columns = {row["name"] for row in db.execute("PRAGMA table_info(market_prices)")}
@@ -984,6 +991,129 @@ def extract_quote_attachment_text(msg):
     return "\n".join(snippets), filenames, issues
 
 
+def extract_supplier_document_text(filename, raw):
+    """Extract text locally from common supplier files; never stores the original bytes."""
+    if len(raw) > 8_000_000:
+        raise ValueError("Cada documento puede pesar como máximo 8 MB.")
+    suffix = Path(filename).suffix.lower()
+    if suffix in (".pdf",):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(raw), strict=False)
+        text = "\n".join((page.extract_text() or "") for page in reader.pages[:20])[:20_000]
+        if not text.strip():
+            raise ValueError("El PDF no contiene texto seleccionable. Los documentos escaneados requieren OCR local, aún no instalado.")
+        return text
+    if suffix in (".xlsx", ".xlsm"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
+                raise ValueError("El documento comprimido excede el límite de seguridad.")
+        from openpyxl import load_workbook
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        lines = []
+        for sheet in workbook.worksheets[:5]:
+            for row in sheet.iter_rows(max_row=300, max_col=30, values_only=True):
+                line = " | ".join(str(v).strip() for v in row if v is not None and str(v).strip())
+                if line:
+                    lines.append(line)
+                if sum(map(len, lines)) >= 20_000:
+                    break
+            if sum(map(len, lines)) >= 20_000:
+                break
+        workbook.close()
+        return "\n".join(lines)[:20_000]
+    if suffix == ".xls":
+        import xlrd
+        book = xlrd.open_workbook(file_contents=raw, on_demand=True)
+        lines = []
+        for sheet in book.sheets()[:5]:
+            for row in range(min(sheet.nrows, 300)):
+                line = " | ".join(str(v).strip() for v in sheet.row_values(row)[:30] if str(v).strip())
+                if line:
+                    lines.append(line)
+                if sum(map(len, lines)) >= 20_000:
+                    break
+            if sum(map(len, lines)) >= 20_000:
+                break
+        book.release_resources()
+        return "\n".join(lines)[:20_000]
+    if suffix in (".docx", ".pptx", ".odt", ".ods", ".odp"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
+                raise ValueError("El documento comprimido excede el límite de seguridad.")
+            if suffix == ".docx":
+                names = [n for n in archive.namelist() if re.fullmatch(r"word/(document|header\d*|footer\d*)\.xml", n)]
+            elif suffix == ".pptx":
+                names = sorted(n for n in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))[:30]
+            elif suffix == ".odt":
+                names = ["content.xml"]
+            elif suffix == ".ods":
+                names = ["content.xml"]
+            else:
+                names = ["content.xml"]
+            lines = []
+            for name in names:
+                if name not in archive.namelist():
+                    continue
+                root = ET.fromstring(archive.read(name))
+                lines.extend(t.strip() for t in root.itertext() if t and t.strip())
+                if sum(map(len, lines)) > 20_000:
+                    break
+            return "\n".join(lines)[:20_000]
+    if suffix in (".csv", ".tsv"):
+        rows = csv.reader(io.StringIO(raw.decode("utf-8-sig", errors="replace")), delimiter="\t" if suffix == ".tsv" else ",")
+        return "\n".join(" | ".join(row) for row in list(rows)[:500])[:20_000]
+    if suffix in (".txt", ".text", ".md"):
+        return raw.decode("utf-8-sig", errors="replace")[:20_000]
+    if suffix in (".html", ".htm"):
+        from html.parser import HTMLParser
+        class TextOnly(HTMLParser):
+            def __init__(self):
+                super().__init__(); self.parts = []
+            def handle_data(self, data):
+                if data.strip(): self.parts.append(data.strip())
+        parser = TextOnly(); parser.feed(raw.decode("utf-8", errors="replace"))
+        return "\n".join(parser.parts)[:20_000]
+    if suffix == ".rtf":
+        text = raw.decode("latin-1", errors="replace")
+        text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
+        text = re.sub(r"\\[a-zA-Z]+-?\d* ?|[{}]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()[:20_000]
+    if suffix in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"):
+        raise ValueError("La imagen se recibió sólo para lectura local, pero falta configurar OCR. Exporta a PDF con texto o transcribe los campos.")
+    raise ValueError("Formato no compatible. Usa PDF, Word, Excel, CSV, texto, HTML, RTF, OpenDocument o una imagen (OCR pendiente).")
+
+
+def parse_supplier_quote_text(text, filename=""):
+    money = re.search(r"(?:US\$|USD\s*|CNY\s*|RMB\s*|CLP\s*\$?|\$|¥|￥)\s*([\d.,]+)", text, re.I)
+    amount, currency = None, "USD"
+    if money:
+        token = money.group(1)
+        if "," in token and "." in token:
+            token = token.replace(",", "") if token.rfind(".") > token.rfind(",") else token.replace(".", "").replace(",", ".")
+        elif token.count(",") == 1:
+            token = token.replace(",", ".")
+        try: amount = float(token)
+        except ValueError: amount = None
+        prefix = money.group(0).upper()
+        currency = "CNY" if any(x in prefix for x in ("CNY", "RMB", "¥", "￥")) else "CLP" if "CLP" in prefix else "USD"
+    known = ["Carta", "Oficio", "A4", "resma", "paper", "notebook", "复印纸"]
+    product = ""
+    for word in known:
+        match = re.search(r".{0,30}" + re.escape(word) + r".{0,50}", text, re.I)
+        if match:
+            product = " ".join(match.group(0).split())[:120]; break
+    moq = re.search(r"(?:MOQ|minimum order|pedido mínimo|起订量)\D{0,12}(\d[\d,]*)", text, re.I)
+    incoterm = re.search(r"\b(FOB|CIF|EXW|DAP|DDP)\b", text, re.I)
+    payment = re.search(r"(?:payment|pago|付款条件)\D{0,15}([^\n.;]{3,45})", text, re.I)
+    return {"supplier": "", "product_hint": product, "unit_price": amount, "currency": currency,
+            "moq": int(moq.group(1).replace(",", "")) if moq else 0,
+            "incoterm": incoterm.group(1).upper() if incoterm else "",
+            "payment_terms": payment.group(1).strip() if payment else "",
+            "quote_date": date.today().isoformat(), "notes": f"Documento {filename}; datos sugeridos automáticamente, validar unidad y precio."}
+
+
 def parse_message(msg):
     body = []
     if msg.is_multipart():
@@ -1234,8 +1364,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def body_json(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 5_000_000:
-            raise ValueError("La solicitud supera el límite permitido de 5 MB.")
+        if length > 12_000_000:
+            raise ValueError("La solicitud supera el límite permitido de 12 MB.")
         return json.loads(self.rfile.read(length) or b"{}")
 
     def local_request_allowed(self):
@@ -1335,6 +1465,19 @@ class Handler(BaseHTTPRequestHandler):
                     row["parsed"] = json.loads(row.pop("parsed_json"))
                 self.send_json(rows)
                 return
+            if path == "/api/supplier-documents":
+                rows = [dict(r) for r in db.execute("SELECT id,filename,parsed_json,status,captured_at FROM supplier_document_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
+                for row in rows:
+                    row["parsed"] = json.loads(row.pop("parsed_json"))
+                self.send_json(rows)
+                return
+            document_match = re.fullmatch(r"/api/supplier-documents/(\d+)", path)
+            if document_match:
+                row = db.execute("SELECT id,filename,parsed_json,extracted_text,status,captured_at FROM supplier_document_reviews WHERE id=?", (int(document_match.group(1)),)).fetchone()
+                if row is None:
+                    self.send_json({"error": "Documento no encontrado."}, 404); return
+                result = dict(row); result["parsed"] = json.loads(result.pop("parsed_json"))
+                self.send_json(result); return
         self.send_json({"error": "No encontrado"}, 404)
 
     def do_POST(self):
@@ -1344,6 +1487,54 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self.body_json()
+            if path == "/api/supplier-documents/parse":
+                filename = Path(str(payload.get("filename", "documento"))).name[:180]
+                encoded = str(payload.get("content_base64", ""))
+                if len(encoded) > 11_000_000:
+                    raise ValueError("Cada archivo puede pesar como máximo 8 MB.")
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except Exception as exc:
+                    raise ValueError("No se pudo leer el archivo seleccionado.") from exc
+                extracted = extract_supplier_document_text(filename, raw)
+                if not extracted.strip():
+                    raise ValueError("No se encontró texto legible en el documento.")
+                parsed = parse_supplier_quote_text(extracted, filename)
+                with connect_db() as db:
+                    cursor = db.execute("INSERT INTO supplier_document_reviews(filename,parsed_json,extracted_text,status,captured_at) VALUES(?,?,?,'pending',?)",
+                                        (filename, json.dumps(parsed, ensure_ascii=False), extracted[:20_000], datetime.now().isoformat(timespec="minutes")))
+                    review_id = cursor.lastrowid
+                self.send_json({"id": review_id, "filename": filename, "parsed": parsed,
+                                "extracted_text": extracted[:20_000], "status": "pending"})
+                return
+            document_match = re.fullmatch(r"/api/supplier-documents/(\d+)/(approve|ignore)", path)
+            if document_match:
+                review_id, action = int(document_match.group(1)), document_match.group(2)
+                with connect_db() as db:
+                    row = db.execute("SELECT * FROM supplier_document_reviews WHERE id=? AND status='pending'", (review_id,)).fetchone()
+                    if row is None:
+                        raise ValueError("El documento ya no está pendiente de revisión.")
+                    if action == "ignore":
+                        db.execute("UPDATE supplier_document_reviews SET status='ignored' WHERE id=?", (review_id,))
+                        self.send_json({"ok": True}); return
+                    supplier = str(payload.get("supplier", "")).strip()[:254]
+                    product = str(payload.get("product", "")).strip()[:200]
+                    currency = str(payload.get("currency", "USD")).upper()
+                    price = float(payload.get("unit_price", 0))
+                    parsed = json.loads(row["parsed_json"])
+                    if not supplier or not product or not db.execute("SELECT 1 FROM products WHERE name=?", (product,)).fetchone():
+                        raise ValueError("Indica un proveedor y selecciona un producto existente del catálogo.")
+                    if price <= 0 or currency not in ("USD", "CNY", "CLP", "BRL"):
+                        raise ValueError("Confirma un precio unitario mayor a cero y una moneda válida.")
+                    db.execute("""INSERT INTO quotes(supplier,product,unit_price,currency,moq,incoterm,payment_terms,source_url,quote_date,notes)
+                                VALUES(?,?,?,?,?,?,?,?,?,?)""", (supplier, product, price, currency,
+                                float(payload.get("moq", parsed.get("moq", 0)) or 0),
+                                str(payload.get("incoterm", parsed.get("incoterm", "")))[:20],
+                                str(payload.get("payment_terms", parsed.get("payment_terms", "")))[:200],
+                                "", date.today().isoformat(), str(payload.get("notes", "")).strip()[:2000] + f" · Archivo proveedor: {row['filename']}"))
+                    db.execute("UPDATE supplier_document_reviews SET status='approved' WHERE id=?", (review_id,))
+                self.send_json({"ok": True})
+                return
             if path == "/api/mercadolibre/config":
                 raise ValueError("Las credenciales de MercadoLibre se configuran en el archivo privado .env del backend.")
             if path == "/api/mercadolibre/auth-url":
@@ -1661,3 +1852,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
