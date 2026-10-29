@@ -939,6 +939,126 @@ def extract_quote_attachment_text(msg):
     return "\n".join(snippets), filenames, issues
 
 
+def parse_xlsx_product_catalog(raw):
+    """Read a product/price/stock list from an XLSX with stdlib XML only."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        members = archive.infolist()
+        if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
+            raise ValueError("El documento comprimido excede el límite de seguridad.")
+        names = set(archive.namelist())
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root:
+                shared.append("".join(node.text or "" for node in item.iter() if node.tag.endswith("}t"))[:4000])
+                if len(shared) >= 200_000:
+                    break
+        sheet_names = sorted((n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+                             key=lambda n: int(re.search(r"sheet(\d+)", n).group(1)))
+        def cell_value(cell):
+            value_node = next((node for node in cell if node.tag.endswith("}v")), None)
+            cell_type = cell.attrib.get("t", "")
+            if cell_type == "inlineStr":
+                return "".join(node.text or "" for node in cell.iter() if node.tag.endswith("}t")).strip()
+            if value_node is None:
+                return ""
+            value = value_node.text or ""
+            if cell_type == "s":
+                try: return shared[int(value)].strip()
+                except (ValueError, IndexError): return ""
+            return value.strip()
+        def column_index(ref):
+            letters = re.match(r"[A-Z]+", ref or "")
+            result = 0
+            for letter in letters.group(0) if letters else "":
+                result = result * 26 + ord(letter) - 64
+            return result - 1
+        headers, records = None, []
+        for sheet_name in sheet_names[:10]:
+            root = ET.fromstring(archive.read(sheet_name))
+            for row in root.iter():
+                if not row.tag.endswith("}row"):
+                    continue
+                values = {}
+                for cell in row:
+                    if cell.tag.endswith("}c"):
+                        values[column_index(cell.attrib.get("r", ""))] = cell_value(cell)
+                if not values:
+                    continue
+                width = max(values) + 1
+                cells = [values.get(i, "") for i in range(width)]
+                if headers is None:
+                    normalized = [re.sub(r"\s+", " ", value).strip().casefold() for value in cells]
+                    desc = next((i for i, value in enumerate(normalized) if "texto breve material" in value or value in ("descripción", "descripcion", "producto")), None)
+                    price = next((i for i, value in enumerate(normalized) if "lista 3" in value or "precio" in value or "price" in value), None)
+                    available = next((i for i, value in enumerate(normalized) if "disponible" in value or "available" in value), None)
+                    if desc is not None and price is not None and available is not None:
+                        headers = cells
+                    continue
+                name_idx = next((i for i, value in enumerate(headers) if "texto breve material" in value.casefold() or value.casefold().strip() in ("descripción", "descripcion", "producto")), None)
+                price_idx = next((i for i, value in enumerate(headers) if "lista 3" in value.casefold() or "precio" in value.casefold() or "price" in value.casefold()), None)
+                if name_idx is None or price_idx is None:
+                    continue
+                name = cells[name_idx].strip() if name_idx < len(cells) else ""
+                price_text = cells[price_idx].strip() if price_idx < len(cells) else ""
+                sku_idx = next((i for i, value in enumerate(headers) if value.casefold().strip() == "sku"), None)
+                sku = cells[sku_idx].strip() if sku_idx is not None and sku_idx < len(cells) else ""
+                if not name or not price_text or price_text.upper() in ("#N/A", "N/A", "-"):
+                    continue
+                try:
+                    price = float(price_text.replace(",", "."))
+                except ValueError:
+                    continue
+                if price < 0:
+                    continue
+                def find_column(*needles):
+                    return next((i for i, header in enumerate(headers) if any(term in header.casefold() for term in needles)), None)
+                def val_at(index):
+                    return cells[index].strip() if index is not None and index < len(cells) else ""
+                def number_at(index):
+                    raw_value = val_at(index).replace(",", ".")
+                    try: return float(raw_value)
+                    except ValueError: return 0
+                stock = {}
+                for idx, header in enumerate(headers):
+                    normalized = header.casefold().strip()
+                    if ("stock" in normalized or normalized.startswith("stk ")) and idx < len(cells):
+                        stock[header.strip() or f"Columna {idx+1}"] = number_at(idx)
+                available_idx = find_column("disponible", "available")
+                arrivals = []
+                for idx, header in enumerate(headers):
+                    if re.search(r"tto\s*\d+", header, re.I):
+                        qty = number_at(idx)
+                        if qty:
+                            match = re.search(r"tto\s*(\d+)", header, re.I)
+                            date_idx = idx + 1
+                            eta = val_at(date_idx)
+                            arrivals.append({"order": int(match.group(1)), "quantity": qty, "eta_raw": eta})
+                def normalized_column(*names):
+                    return find_column(*(name.casefold() for name in names))
+                records.append({
+                    "sku": sku,
+                    "barcode": val_at(find_column("barras", "barcode", "ean")),
+                    "name": name,
+                    "brand": val_at(normalized_column("marca")),
+                    "line": val_at(normalized_column("linea")),
+                    "category": val_at(normalized_column("rubro", "categoría", "categoria")),
+                    "status": val_at(normalized_column("estado")),
+                    "unit_price": price,
+                    "currency": "CLP",
+                    "unit": "unidad",
+                    "pack": {header.strip(): val_at(idx) for idx, header in enumerate(headers)
+                             if header.strip().casefold() in ("emb", "sub", "umv")},
+                    "available": number_at(available_idx),
+                    "stock": stock,
+                    "incoming": arrivals,
+                })
+        if headers is None or not records:
+            return None
+        return {"kind": "product_catalog", "header": headers, "products": records,
+                "count": len(records), "currency": "CLP", "price_column": next((h for h in headers if "lista 3" in h.casefold() or "precio" in h.casefold()), "Precio")}
+
+
 def extract_supplier_document_text(filename, raw):
     """Extract text locally from common supplier files; never stores the original bytes."""
     if len(raw) > 8_000_000:
@@ -1388,7 +1508,8 @@ class Handler(BaseHTTPRequestHandler):
         with connect_db() as db:
             tables = {"/api/products": "products", "/api/quotes": "quotes", "/api/prices": "market_prices"}
             if path in tables:
-                rows = [dict(r) for r in db.execute(f"SELECT * FROM {tables[path]} ORDER BY id DESC LIMIT 500")]
+                limit = 5000 if path in ("/api/products", "/api/prices") else 500
+                rows = [dict(r) for r in db.execute(f"SELECT * FROM {tables[path]} ORDER BY id DESC LIMIT {limit}")]
                 self.send_json(rows)
                 return
             if path == "/api/scenarios":
@@ -1447,7 +1568,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/supplier-documents":
                 rows = [dict(r) for r in db.execute("SELECT id,filename,parsed_json,status,captured_at FROM supplier_document_reviews WHERE status='pending' ORDER BY id DESC LIMIT 200")]
                 for row in rows:
-                    row["parsed"] = json.loads(row.pop("parsed_json"))
+                    parsed = json.loads(row.pop("parsed_json"))
+                    if parsed.get("kind") == "product_catalog":
+                        parsed.pop("products", None)
+                    row["parsed"] = parsed
                 self.send_json(rows)
                 return
             document_match = re.fullmatch(r"/api/supplier-documents/(\d+)", path)
@@ -1478,7 +1602,11 @@ class Handler(BaseHTTPRequestHandler):
                 extracted = extract_supplier_document_text(filename, raw)
                 if not extracted.strip():
                     raise ValueError("No se encontró texto legible en el documento.")
-                parsed = parse_supplier_quote_text(extracted, filename)
+                parsed = parse_xlsx_product_catalog(raw) if Path(filename).suffix.lower() in (".xlsx", ".xlsm") else None
+                if parsed:
+                    parsed["notes"] = "Lista estructurada; revisar todas las columnas y confirmar moneda antes de importar."
+                else:
+                    parsed = parse_supplier_quote_text(extracted, filename)
                 with connect_db() as db:
                     cursor = db.execute("INSERT INTO supplier_document_reviews(filename,parsed_json,extracted_text,status,captured_at) VALUES(?,?,?,'pending',?)",
                                         (filename, json.dumps(parsed, ensure_ascii=False), extracted[:20_000], datetime.now().isoformat(timespec="minutes")))
@@ -1496,6 +1624,42 @@ class Handler(BaseHTTPRequestHandler):
                     if action == "ignore":
                         db.execute("UPDATE supplier_document_reviews SET status='ignored' WHERE id=?", (review_id,))
                         self.send_json({"ok": True}); return
+                    parsed = json.loads(row["parsed_json"])
+                    if parsed.get("kind") == "product_catalog":
+                        seller = str(payload.get("supplier", "")).strip()[:254]
+                        currency = str(payload.get("currency", parsed.get("currency", "CLP"))).upper()
+                        if not seller:
+                            raise ValueError("Escribe el nombre del proveedor o fuente de la lista antes de importar.")
+                        if currency not in ("USD", "CNY", "CLP", "BRL"):
+                            raise ValueError("Confirma una moneda admitida para la lista.")
+                        saved, skipped = 0, 0
+                        observed = datetime.now().isoformat(timespec="minutes")
+                        for item in parsed.get("products", []):
+                            name = str(item.get("name", "")).strip()[:200]
+                            price = float(item.get("unit_price") or 0)
+                            if not name or price < 0:
+                                skipped += 1; continue
+                            spec_parts = [f"SKU {item['sku']}" if item.get("sku") else "",
+                                          f"Código {item['barcode']}" if item.get("barcode") else "",
+                                          item.get("brand", ""), item.get("category", "")]
+                            spec = " · ".join(x for x in spec_parts if x)[:1000]
+                            if not db.execute("SELECT 1 FROM products WHERE name=?", (name,)).fetchone():
+                                db.execute("INSERT INTO products(name,spec,unit,created_at) VALUES(?,?,?,?)",
+                                           (name, spec, item.get("unit", "unidad"), observed))
+                            stocks = item.get("stock", {})
+                            stock_note = [f"Disponible: {item.get('available', 0):g}"]
+                            stock_note.extend(f"{key}: {value:g}" for key, value in stocks.items())
+                            stock_note.extend(f"Tránsito {arrival.get('order')}: {arrival.get('quantity'):g} · fecha origen {arrival.get('eta_raw')}"
+                                              for arrival in item.get("incoming", []))
+                            detail = f"Lista {parsed.get('price_column', 'proveedor')} · SKU {item.get('sku','')} · código {item.get('barcode','')} · marca {item.get('brand','')} · rubro {item.get('category','')} · estado {item.get('status','')}"
+                            db.execute("""INSERT INTO market_prices(seller,product,price,currency,unit,url,observed_at,verified,title,quantity_note)
+                                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                       (seller, name, price, currency, item.get("unit", "unidad"), "", observed, 0,
+                                        detail[:1000], " · ".join(stock_note)[:1000]))
+                            saved += 1
+                        db.execute("UPDATE supplier_document_reviews SET status='approved' WHERE id=?", (review_id,))
+                        self.send_json({"ok": True, "saved": saved, "skipped": skipped, "currency": currency})
+                        return
                     supplier = str(payload.get("supplier", "")).strip()[:254]
                     product = str(payload.get("product", "")).strip()[:200]
                     currency = str(payload.get("currency", "USD")).upper()
