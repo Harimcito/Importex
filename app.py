@@ -928,66 +928,14 @@ def extract_quote_attachment_text(msg):
         if not raw:
             issues.append(f"{filename}: vacío o no legible")
             continue
-        if len(raw) > 8_000_000:
-            issues.append(f"{filename}: supera el límite de 8 MB")
-            continue
-        suffix = Path(filename).suffix.lower()
         try:
-            if suffix == ".pdf" or part.get_content_type() == "application/pdf":
-                from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(raw), strict=False)
-                text = "\n".join((page.extract_text() or "") for page in reader.pages[:20])[:20_000]
-                if not text.strip():
-                    issues.append(f"{filename}: PDF sin texto extraíble (puede requerir OCR)")
-                else:
-                    snippets.append(text)
-            elif suffix in (".xlsx", ".xlsm"):
-                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-                    members = archive.infolist()
-                    if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
-                        issues.append(f"{filename}: contenido comprimido excede el límite de seguridad")
-                        continue
-                from openpyxl import load_workbook
-                workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-                cells = []
-                for sheet in workbook.worksheets[:5]:
-                    for row in sheet.iter_rows(max_row=300, max_col=30, values_only=True):
-                        line = " | ".join(str(v).strip() for v in row if v is not None and str(v).strip())
-                        if line:
-                            cells.append(line)
-                        if sum(len(x) for x in cells) > 20_000:
-                            break
-                    if sum(len(x) for x in cells) > 20_000:
-                        break
-                workbook.close()
-                snippets.append("\n".join(cells)[:20_000])
-            elif suffix == ".xls":
-                import xlrd
-                workbook = xlrd.open_workbook(file_contents=raw, on_demand=True)
-                cells = []
-                for sheet in workbook.sheets()[:5]:
-                    for row_index in range(min(sheet.nrows, 300)):
-                        line = " | ".join(str(value).strip() for value in sheet.row_values(row_index)[:30] if str(value).strip())
-                        if line:
-                            cells.append(line)
-                        if sum(len(x) for x in cells) > 20_000:
-                            break
-                    if sum(len(x) for x in cells) > 20_000:
-                        break
-                workbook.release_resources()
-                snippets.append("\n".join(cells)[:20_000])
-            elif suffix == ".csv" or part.get_content_type() == "text/csv":
-                decoded = raw.decode("utf-8-sig", errors="replace")
-                rows = csv.reader(io.StringIO(decoded))
-                snippets.append("\n".join(" | ".join(row) for row in list(rows)[:500])[:20_000])
-            elif suffix in (".txt", ".text"):
-                snippets.append(raw.decode("utf-8", errors="replace")[:20_000])
+            text = extract_supplier_document_text(filename, raw)
+            if text.strip():
+                snippets.append(text)
             else:
-                issues.append(f"{filename}: formato no procesado")
-        except ImportError:
-            issues.append(f"{filename}: falta instalar el lector requerido para {suffix or 'este formato'}")
-        except Exception:
-            issues.append(f"{filename}: no se pudo extraer texto")
+                issues.append(f"{filename}: no contiene texto extraíble")
+        except Exception as exc:
+            issues.append(f"{filename}: {str(exc)[:180] or 'no se pudo extraer texto'}")
     return "\n".join(snippets), filenames, issues
 
 
