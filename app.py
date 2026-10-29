@@ -1148,11 +1148,14 @@ def extract_supplier_document_text(filename, raw):
         raise ValueError("Cada documento puede pesar como máximo 8 MB.")
     suffix = Path(filename).suffix.lower()
     if suffix in (".pdf",):
-        from pypdf import PdfReader
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise ValueError("Falta el lector PDF de Importex. En esta carpeta ejecuta: python -m pip install -r requirements.txt") from exc
         reader = PdfReader(io.BytesIO(raw), strict=False)
         text = "\n".join((page.extract_text() or "") for page in reader.pages[:20])[:20_000]
         if not text.strip():
-            raise ValueError("El PDF no contiene texto seleccionable. Los documentos escaneados requieren OCR local, aún no instalado.")
+            raise ValueError("El PDF no contiene texto seleccionable. Guarda una copia con texto reconocible o sube la página como JPG/PNG para usar el OCR local.")
         return text
     if suffix in (".xlsx", ".xlsm"):
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -1200,7 +1203,10 @@ def extract_supplier_document_text(filename, raw):
                     break
             return "\n".join(lines)[:20_000]
     if suffix == ".xls":
-        import xlrd
+        try:
+            import xlrd
+        except ImportError as exc:
+            raise ValueError("Falta el lector Excel antiguo de Importex. En esta carpeta ejecuta: python -m pip install -r requirements.txt") from exc
         book = xlrd.open_workbook(file_contents=raw, on_demand=True)
         lines = []
         for sheet in book.sheets()[:5]:
