@@ -759,6 +759,7 @@ class PriceParser(HTMLParser):
         self.prices = []
         self.title = ""
         self.in_title = False
+        self.login_form = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -768,6 +769,8 @@ class PriceParser(HTMLParser):
             self.prices.append(attrs.get("content", ""))
         if tag == "meta" and attrs.get("itemprop") == "price":
             self.prices.append(attrs.get("content", ""))
+        if tag == "input" and str(attrs.get("type", "")).lower() == "password":
+            self.login_form = True
         if tag == "meta" and attrs.get("property") in ("product:price:currency", "og:price:currency"):
             self.parts.append(" CURRENCY:" + attrs.get("content", ""))
         if attrs.get("itemprop") == "price" and attrs.get("content"):
@@ -810,16 +813,24 @@ class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def safe_price_fetch(url):
     validate_public_url(url)
+    parsed = urllib.parse.urlparse(url)
     req = urllib.request.Request(url, headers={"User-Agent": "ComercioPriceCheck/1.0"})
     opener = urllib.request.build_opener(PublicRedirectHandler())
     with opener.open(req, timeout=12) as resp:
-        validate_public_url(resp.geturl())
+        final_url = resp.geturl()
+        validate_public_url(final_url)
         ctype = resp.headers.get("Content-Type", "")
         if "html" not in ctype.lower():
             raise ValueError("La dirección no devolvió una página HTML pública.")
         raw = resp.read(2_000_000).decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
     parser = PriceParser()
     parser.feed(raw)
+    final_path = urllib.parse.urlparse(final_url).path
+    page_text = " ".join(parser.parts)
+    login_path = re.search(r"(?:^|/)(?:login|log-in|signin|sign-in|auth)(?:/|$)", final_path, re.I)
+    login_copy = re.search(r"\b(sign in|log in|iniciar sesión|inicia sesión|inicia sesion|accede a tu cuenta|please log in)\b", page_text, re.I)
+    if login_path or parser.login_form and login_copy:
+        raise ValueError("El sitio muestra una página de inicio de sesión. Importex sólo lee precios visibles públicamente y no puede usar ni omitir esa autenticación. Inicia sesión por tu cuenta y registra el precio manualmente, o usa un enlace público del producto.")
     values = [v.strip() for v in parser.prices if re.fullmatch(r"\d+(?:[.,]\d{1,4})?", v.strip())]
     if not values:
         text = " ".join(parser.parts)
@@ -827,11 +838,11 @@ def safe_price_fetch(url):
     if not values:
         raise ValueError("No encontré un precio estructurado. Puedes ingresarlo manualmente; algunas páginas lo ocultan o requieren iniciar sesión.")
     raw_price = values[0].replace(" ", "")
-    full_text = " ".join(parser.parts)
+    full_text = page_text
     marked = next((p.split("CURRENCY:", 1)[1] for p in parser.parts if "CURRENCY:" in p), "")
     currency = marked.upper() if marked else "CLP"
     if not marked:
-        if "1688.com" in parsed.hostname or "¥" in full_text or "￥" in full_text:
+        if "1688.com" in (parsed.hostname or "").lower() or "¥" in full_text or "￥" in full_text:
             currency = "CNY"
         elif "US$" in full_text or "USD" in full_text:
             currency = "USD"
