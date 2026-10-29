@@ -760,8 +760,16 @@ class PriceParser(HTMLParser):
         self.title = ""
         self.in_title = False
         self.login_form = False
+        self.ignored_depth = 0
 
     def handle_starttag(self, tag, attrs):
+        if self.ignored_depth:
+            if tag in ("script", "style", "noscript"):
+                self.ignored_depth += 1
+            return
+        if tag in ("script", "style", "noscript"):
+            self.ignored_depth = 1
+            return
         attrs = dict(attrs)
         if tag == "title":
             self.in_title = True
@@ -777,10 +785,15 @@ class PriceParser(HTMLParser):
             self.prices.append(attrs["content"])
 
     def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript") and self.ignored_depth:
+            self.ignored_depth -= 1
+            return
         if tag == "title":
             self.in_title = False
 
     def handle_data(self, data):
+        if self.ignored_depth:
+            return
         if self.in_title:
             self.title += data.strip()
         text = data.strip()
@@ -828,7 +841,7 @@ def safe_price_fetch(url):
     final_path = urllib.parse.urlparse(final_url).path
     page_text = " ".join(parser.parts)
     login_path = re.search(r"(?:^|/)(?:login|log-in|signin|sign-in|auth)(?:/|$)", final_path, re.I)
-    login_copy = re.search(r"\b(sign in|log in|iniciar sesión|inicia sesión|inicia sesion|accede a tu cuenta|please log in)\b", page_text, re.I)
+    login_copy = re.search(r"\b(sign in|log in|iniciar sesión|inicia sesión|inicia sesion|accede a tu cuenta|ingresa tu usuario|please log in)\b", page_text, re.I)
     if login_path or parser.login_form and login_copy:
         raise ValueError("El sitio muestra una página de inicio de sesión. Importex sólo lee precios visibles públicamente y no puede usar ni omitir esa autenticación. Inicia sesión por tu cuenta y registra el precio manualmente, o usa un enlace público del producto.")
     values = [v.strip() for v in parser.prices if re.fullmatch(r"\d+(?:[.,]\d{1,4})?", v.strip())]
