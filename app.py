@@ -15,6 +15,7 @@ import smtplib
 import socket
 import ssl
 import sqlite3
+import sys
 import threading
 import time
 import urllib.error
@@ -31,6 +32,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+LOCAL_RUNTIME_PATH = ROOT / ".runtime_libs"
+if LOCAL_RUNTIME_PATH.is_dir() and str(LOCAL_RUNTIME_PATH) not in sys.path:
+    sys.path.insert(0, str(LOCAL_RUNTIME_PATH))
 DB_PATH = ROOT / "comercio.sqlite3"
 ENV_PATH = ROOT / ".env"
 PORT = 8765
@@ -1083,6 +1087,61 @@ def parse_xlsx_product_catalog(raw):
                 "count": len(records), "currency": "CLP", "price_column": next((h for h in headers if "lista 3" in h.casefold() or "precio" in h.casefold()), "Precio")}
 
 
+def ocr_supplier_image(raw):
+    """Read a supplier image with the Windows OCR engine; image bytes stay local."""
+    if sys.platform != "win32":
+        raise ValueError("El OCR local de imágenes está disponible en Windows. Convierte la imagen a PDF con texto en este sistema.")
+    try:
+        import asyncio
+        from winrt.windows.globalization import Language
+        from winrt.windows.graphics.imaging import BitmapDecoder
+        from winrt.windows.media.ocr import OcrEngine
+        from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
+    except ImportError as exc:
+        raise ValueError("Falta instalar el OCR local. En esta carpeta ejecuta: python -m pip install -r requirements.txt") from exc
+
+    async def recognize():
+        languages = list(OcrEngine.available_recognizer_languages)
+        spanish = next((item.language_tag for item in languages if item.language_tag.casefold().startswith("es-")), None)
+        if not spanish:
+            raise ValueError("Windows no tiene instalado el idioma OCR español. Agrega Español en Configuración > Hora e idioma > Idioma y región, incluyendo reconocimiento óptico de caracteres.")
+        engine = OcrEngine.try_create_from_language(Language(spanish))
+        if engine is None:
+            raise ValueError("Windows no pudo iniciar el reconocimiento OCR en español.")
+        stream = InMemoryRandomAccessStream()
+        writer = DataWriter(stream.get_output_stream_at(0))
+        writer.write_bytes(raw)
+        await writer.store_async()
+        await writer.flush_async()
+        stream.seek(0)
+        decoder = await BitmapDecoder.create_async(stream)
+        if int(decoder.oriented_pixel_width) * int(decoder.oriented_pixel_height) > 40_000_000:
+            raise ValueError("La imagen supera el límite de 40 megapíxeles para proteger la memoria.")
+        page_count = min(int(decoder.frame_count), 5)
+        lines = []
+        for index in range(page_count):
+            frame = await decoder.get_frame_async(index)
+            bitmap = await frame.get_software_bitmap_async()
+            result = await engine.recognize_async(bitmap)
+            lines.extend(line.text.strip() for line in result.lines if line.text.strip())
+            bitmap.close()
+            if sum(map(len, lines)) >= 20_000:
+                break
+        writer.close()
+        stream.close()
+        text = "\n".join(lines)[:20_000]
+        if not text.strip():
+            raise ValueError("No se detectó texto en la imagen. Prueba con una foto nítida, bien iluminada y sin inclinación.")
+        return text
+
+    try:
+        return asyncio.run(recognize())
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Windows no pudo leer esta imagen. Comprueba que sea JPG, PNG, TIFF o BMP y que no esté dañada.") from exc
+
+
 def extract_supplier_document_text(filename, raw):
     """Extract text locally from common supplier files; never stores the original bytes."""
     if len(raw) > 8_000_000:
@@ -1199,8 +1258,8 @@ def extract_supplier_document_text(filename, raw):
         text = re.sub(r"\\[a-zA-Z]+-?\d* ?|[{}]", " ", text)
         return re.sub(r"\s+", " ", text).strip()[:20_000]
     if suffix in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"):
-        raise ValueError("La imagen se recibió sólo para lectura local, pero falta configurar OCR. Exporta a PDF con texto o transcribe los campos.")
-    raise ValueError("Formato no compatible. Usa PDF, Word, Excel, CSV, texto, HTML, RTF, OpenDocument o una imagen (OCR pendiente).")
+        return ocr_supplier_image(raw)
+    raise ValueError("Formato no compatible. Usa PDF, Word, Excel, CSV, texto, HTML, RTF, OpenDocument o imagen JPG/PNG/TIFF/BMP.")
 
 
 def parse_supplier_quote_text(text, filename=""):
