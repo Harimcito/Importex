@@ -1104,14 +1104,19 @@ def parse_supplier_quote_text(text, filename=""):
         match = re.search(r".{0,30}" + re.escape(word) + r".{0,50}", text, re.I)
         if match:
             product = " ".join(match.group(0).split())[:120]; break
+    supplier_match = re.search(r"(?:supplier|company|manufacturer|exporter|from|供应商|公司)\s*[:：]\s*([^\n|,;]{2,100})", text, re.I)
+    supplier = " ".join(supplier_match.group(1).split())[:100] if supplier_match else ""
     moq = re.search(r"(?:MOQ|minimum order|pedido mínimo|起订量)\D{0,12}(\d[\d,]*)", text, re.I)
     incoterm = re.search(r"\b(FOB|CIF|EXW|DAP|DDP)\b", text, re.I)
     payment = re.search(r"(?:payment|pago|付款条件)\D{0,15}([^\n.;]{3,45})", text, re.I)
-    return {"supplier": "", "product_hint": product, "unit_price": amount, "currency": currency,
+    notes = f"Documento {filename}; datos sugeridos automáticamente, validar unidad y precio."
+    if money and money.group(0).lstrip().startswith("$"):
+        notes += " El símbolo $ no identifica por sí solo si la moneda es USD o CLP."
+    return {"supplier": supplier, "product_hint": product, "unit_price": amount, "currency": currency,
             "moq": int(moq.group(1).replace(",", "")) if moq else 0,
             "incoterm": incoterm.group(1).upper() if incoterm else "",
             "payment_terms": payment.group(1).strip() if payment else "",
-            "quote_date": date.today().isoformat(), "notes": f"Documento {filename}; datos sugeridos automáticamente, validar unidad y precio."}
+            "quote_date": date.today().isoformat(), "notes": notes}
 
 
 def parse_message(msg):
