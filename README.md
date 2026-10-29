@@ -5,7 +5,7 @@ Panel local para comparar precios en Chile, registrar ofertas de proveedores y e
 ## Iniciar
 
 1. Abre una terminal en esta carpeta.
-2. Ejecuta `python -m pip install -r requirements.txt` para habilitar extracción de texto PDF y Excel.
+2. Ejecuta `python -m pip install -r requirements.txt` para habilitar extracción local de documentos PDF y hojas de cálculo.
 3. Ejecuta `python app.py`.
 4. Abre `http://127.0.0.1:8765` en tu navegador.
 5. Para detenerlo, vuelve a la terminal y pulsa `Ctrl+C`.
@@ -51,7 +51,9 @@ Los datos estructurados quedan en `comercio.sqlite3`, dentro de esta carpeta. Ha
 - La conexión inicial usa el puerto 993, común para IMAP SSL/TLS en cPanel. El servidor y la cuenta se completan en la pantalla; verifica los valores exactos en tu hosting. [Guía de configuración de correo cPanel](https://docs.cpanel.net/cpanel/email/set-up-mail-client/)
 - La primera activación establece un punto inicial y no importa correos antiguos. Importex procesa el cuerpo y adjuntos compatibles localmente, pero conserva sólo campos extraídos, asunto, remitente y carpeta para revisión; no guarda cuerpo ni adjuntos originales. La contraseña IMAP se escribe en el panel y queda cifrada con DPAPI; nunca se pega en el chat.
 - DPAPI intenta primero cifrado ligado al perfil Windows. Si Importex corre bajo un perfil aislado sin esas claves, usa protección DPAPI de equipo; otras cuentas locales que tengan acceso al archivo de datos podrían descifrar ese secreto. El panel muestra cuándo ocurre ese modo.
-- Para extraer texto PDF y Excel se instalan las dependencias de `requirements.txt`. La extracción de texto no es OCR: archivos escaneados deben procesarse aparte.
+- En “Proveedores y productos” puedes leer PDF con texto, Word, Excel, CSV/TSV, texto, Markdown, HTML, RTF, PowerPoint y OpenDocument. Cada archivo se procesa en el computador, con un máximo de 8 MB por archivo, y el original se descarta al terminar. Sólo se conservan texto extraído y campos sugeridos en la bandeja local hasta confirmar o descartar.
+- Los campos detectados por reglas locales son aproximados: proveedor, precio, moneda, MOQ, Incoterm y pago pueden no reconocerse o interpretarse mal; siempre se exige confirmar proveedor y producto del catálogo antes de crear una cotización. La carga documental no comparte archivos con OpenAI.
+- PDF escaneados e imágenes aún requieren OCR y por ahora se muestran como no procesables; el lector no ejecuta macros ni conserva los binarios. Archivos protegidos, corruptos o formatos no compatibles deben convertirse a un formato admitido.
 - La consulta de precio web es un lector genérico. No funciona de forma fiable en sitios con inicio de sesión, contenido cargado por JavaScript, bloqueo de robots o formatos particulares; 1688 puede requerir ingreso manual de precio CNY y MOQ.
 - Las consultas manuales a MercadoLibre y ComexChile ocurren sólo al pulsar sus botones. Si activas la programación de MercadoLibre, se consultará a diario y sus datos concretos se guardarán automáticamente como “Por revisar”. Los resultados de ChileCompra se guardan sólo tras confirmar cada fila. No se automatiza el acceso de 1688 ni se copia código de otros servicios.
 - El cotizador de ComexChile requiere peso y dimensiones reales por bulto. Su estimación puede no cubrir el tramo final a Arica, almacenaje, documentación, manejo portuario ni cargos aduaneros; revisa el desglose y la vigencia con un agente de carga antes de usarlo en una decisión.
@@ -80,3 +82,4 @@ Para una instalación personal, las claves de integraciones se cargan una vez en
 Variables disponibles: `IMPORTEX_OPENAI_API_KEY` y `IMPORTEX_OPENAI_MODEL`, `IMPORTEX_BDE_API_KEY_TOKEN`, `IMPORTEX_CHILECOMPRA_API_TICKET` y `IMPORTEX_MERCADOLIBRE_CLIENT_ID`, `IMPORTEX_MERCADOLIBRE_CLIENT_SECRET`, `IMPORTEX_MERCADOLIBRE_REDIRECT_URI`. MercadoLibre mantiene sus tokens OAuth renovables cifrados en la base local; la interfaz conserva sólo la acción de autorización y el campo de código de retorno.
 
 El servidor nunca devuelve estos secretos al navegador. El archivo `.env` está excluido de Git. Las credenciales cifradas previamente en `comercio.sqlite3` siguen como respaldo para no cortar integraciones antiguas; cuando exista una variable del backend, ésta tiene prioridad. No publiques ni compartas el archivo `.env`.
+
