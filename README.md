@@ -5,7 +5,7 @@ Panel local para comparar precios en Chile, registrar ofertas de proveedores y e
 ## Iniciar
 
 1. Abre una terminal en esta carpeta.
-2. Ejecuta `python -m pip install -r requirements.txt` para habilitar extracción local de documentos PDF y hojas de cálculo.
+2. Ejecuta `python -m pip install -r requirements.txt` para habilitar extracción local de PDF, hojas de cálculo y OCR de imágenes. En Windows, asegúrate de tener agregado el idioma español con reconocimiento óptico de caracteres en Configuración > Hora e idioma > Idioma y región.
 3. Ejecuta `python app.py`.
 4. Abre `http://127.0.0.1:8765` en tu navegador.
 5. Para detenerlo, vuelve a la terminal y pulsa `Ctrl+C`.
@@ -54,7 +54,7 @@ Los datos estructurados quedan en `comercio.sqlite3`, dentro de esta carpeta. Ha
 - En “Proveedores y productos” puedes leer PDF con texto, Word, Excel, CSV/TSV, texto, Markdown, HTML, RTF, PowerPoint y OpenDocument. Cada archivo se procesa en el computador, con un máximo de 8 MB por archivo, y el original se descarta al terminar. Sólo se conservan texto extraído y campos sugeridos en la bandeja local hasta confirmar o descartar.
 - Las hojas XLSX tipo catálogo se detectan por encabezados de producto, precio y disponibilidad. La vista previa separa SKU, código de barras, descripción, marca, categoría, precio de lista, unidades disponibles, existencias por bodega y cantidades en tránsito. Se puede exportar la lista completa a CSV; la importación agrega productos y guarda precios como observaciones “Por revisar”. La moneda de la lista debe confirmarse.
 - Los campos detectados por reglas locales son aproximados: proveedor, precio, moneda, MOQ, Incoterm y pago pueden no reconocerse o interpretarse mal; siempre se exige confirmar proveedor y producto del catálogo antes de crear una cotización. La carga documental no comparte archivos con OpenAI.
-- PDF escaneados e imágenes aún requieren OCR y por ahora se muestran como no procesables; el lector no ejecuta macros ni conserva los binarios. Archivos protegidos, corruptos o formatos no compatibles deben convertirse a un formato admitido.
+- Las imágenes JPG, PNG, TIFF y BMP se reconocen localmente con Windows OCR en español; no se envían a OpenAI. El usuario debe revisar los campos detectados porque fotos inclinadas, borrosas o de baja resolución pueden producir errores. Los PDF escaneados aún requieren texto seleccionable; el lector no ejecuta macros ni conserva los binarios.
 - La consulta de precio web es un lector genérico. No funciona de forma fiable en sitios con inicio de sesión, contenido cargado por JavaScript, bloqueo de robots o formatos particulares; 1688 puede requerir ingreso manual de precio CNY y MOQ.
 - Las consultas manuales a MercadoLibre y ComexChile ocurren sólo al pulsar sus botones. Si activas la programación de MercadoLibre, se consultará a diario y sus datos concretos se guardarán automáticamente como “Por revisar”. Los resultados de ChileCompra se guardan sólo tras confirmar cada fila. No se automatiza el acceso de 1688 ni se copia código de otros servicios.
 - El cotizador de ComexChile requiere peso y dimensiones reales por bulto. Su estimación puede no cubrir el tramo final a Arica, almacenaje, documentación, manejo portuario ni cargos aduaneros; revisa el desglose y la vigencia con un agente de carga antes de usarlo en una decisión.
