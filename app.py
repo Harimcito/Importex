@@ -1008,20 +1008,46 @@ def extract_supplier_document_text(filename, raw):
             members = archive.infolist()
             if len(members) > 2000 or sum(item.file_size for item in members) > 50_000_000:
                 raise ValueError("El documento comprimido excede el límite de seguridad.")
-        from openpyxl import load_workbook
-        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        lines = []
-        for sheet in workbook.worksheets[:5]:
-            for row in sheet.iter_rows(max_row=300, max_col=30, values_only=True):
-                line = " | ".join(str(v).strip() for v in row if v is not None and str(v).strip())
-                if line:
-                    lines.append(line)
-                if sum(map(len, lines)) >= 20_000:
+            names = set(archive.namelist())
+            shared = []
+            if "xl/sharedStrings.xml" in names:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root:
+                    shared.append("".join(node.text or "" for node in item.iter() if node.tag.endswith("}t"))[:4000])
+                    if len(shared) >= 200_000:
+                        break
+            sheets = sorted((n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+                            key=lambda n: int(re.search(r"sheet(\d+)", n).group(1)))[:5]
+            lines = []
+            for sheet_name in sheets:
+                root = ET.fromstring(archive.read(sheet_name))
+                for row in root.iter():
+                    if not row.tag.endswith("}row"):
+                        continue
+                    values = []
+                    for cell in list(row)[:30]:
+                        if not cell.tag.endswith("}c"):
+                            continue
+                        cell_type = cell.attrib.get("t", "")
+                        value_node = next((node for node in cell if node.tag.endswith("}v")), None)
+                        if cell_type == "inlineStr":
+                            value = "".join(node.text or "" for node in cell.iter() if node.tag.endswith("}t"))
+                        elif value_node is not None:
+                            value = value_node.text or ""
+                            if cell_type == "s":
+                                try: value = shared[int(value)]
+                                except (ValueError, IndexError): value = ""
+                        else:
+                            value = ""
+                        if value.strip():
+                            values.append(value.strip()[:500])
+                    if values:
+                        lines.append(" | ".join(values))
+                    if len(lines) >= 1500 or sum(map(len, lines)) >= 20_000:
+                        break
+                if len(lines) >= 1500 or sum(map(len, lines)) >= 20_000:
                     break
-            if sum(map(len, lines)) >= 20_000:
-                break
-        workbook.close()
-        return "\n".join(lines)[:20_000]
+            return "\n".join(lines)[:20_000]
     if suffix == ".xls":
         import xlrd
         book = xlrd.open_workbook(file_contents=raw, on_demand=True)
