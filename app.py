@@ -87,6 +87,91 @@ def configured_secret_status(values, env_name, db_key):
     return bool(secret), source
 
 
+def calculate_product_economics(data):
+    """Calculate a product-level import and resale scenario; monetary inputs are CLP except quote price."""
+    def number(key, label, default=None):
+        raw = data.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"Completa el campo {label} con un número válido.")
+        if not __import__("math").isfinite(value) or value < 0:
+            raise ValueError(f"{label} debe ser un número igual o mayor que cero.")
+        return value
+
+    product = str(data.get("product", "")).strip()[:200]
+    supplier = str(data.get("supplier", "")).strip()[:200]
+    currency = str(data.get("currency", "USD")).strip().upper()
+    if not product:
+        raise ValueError("Selecciona un producto del catálogo.")
+    if currency not in ("USD", "CNY", "CLP", "BRL"):
+        raise ValueError("La moneda de cotización no está admitida.")
+    quote_price = number("quote_price", "precio cotizado")
+    fx_clp = number("fx_clp", "tipo de cambio a CLP")
+    quantity = number("quantity", "cantidad a comprar")
+    sale_price = number("sale_price", "precio de venta")
+    if quote_price <= 0 or fx_clp <= 0 or quantity <= 0 or sale_price <= 0:
+        raise ValueError("Precio, cantidad y tipo de cambio deben ser mayores que cero.")
+    if quantity != int(quantity):
+        raise ValueError("La cantidad a comprar debe ser un número entero de unidades.")
+
+    freight = number("freight_clp", "flete por unidad")
+    insurance = number("insurance_clp", "seguro por unidad")
+    local_cost = number("local_clp", "gastos locales por unidad")
+    duty_pct = number("duty_pct", "arancel")
+    vat_pct = number("vat_pct", "IVA")
+    commission_pct = number("commission_pct", "comisión")
+    packaging = number("packaging_clp", "embalaje por unidad")
+    delivery = number("delivery_clp", "despacho por unidad")
+    other_variable = number("other_variable_clp", "otros costos variables")
+    fixed_costs = number("fixed_clp", "costos fijos")
+    target_margin_pct = number("target_margin_pct", "margen objetivo")
+    if any(value > 100 for value in (duty_pct, vat_pct, commission_pct, target_margin_pct)):
+        raise ValueError("Arancel, IVA, comisión y margen objetivo no pueden superar 100%.")
+
+    purchase = quote_price * fx_clp
+    import_base = purchase + freight + insurance
+    duty = import_base * duty_pct / 100
+    landed = import_base + duty + local_cost
+    import_vat = (import_base + duty) * vat_pct / 100
+    includes_vat = bool(data.get("sale_includes_vat", True))
+    sale_gross = sale_price if includes_vat else sale_price * (1 + vat_pct / 100)
+    sale_net = sale_price / (1 + vat_pct / 100) if includes_vat else sale_price
+    sale_vat = sale_gross - sale_net
+    commission = sale_gross * commission_pct / 100
+    variable_costs = commission + packaging + delivery + other_variable
+    gross_profit = sale_net - landed
+    contribution = gross_profit - variable_costs
+    total_operating_profit = contribution * quantity - fixed_costs
+    target = target_margin_pct / 100
+    max_purchase = (sale_net * (1 - target) - variable_costs - fixed_costs / quantity - local_cost) / (1 + duty_pct / 100) - freight - insurance
+    gross_margin = gross_profit / sale_net
+    operating_margin = total_operating_profit / (sale_net * quantity)
+    break_even = (fixed_costs / contribution) if contribution > 0 else None
+    result = {
+        "purchase_unit_clp": purchase, "purchase_total_clp": purchase * quantity,
+        "freight_unit_clp": freight, "insurance_unit_clp": insurance,
+        "duty_unit_clp": duty, "local_unit_clp": local_cost,
+        "landed_unit_clp": landed, "landed_total_clp": landed * quantity,
+        "import_vat_unit_clp": import_vat, "import_vat_total_clp": import_vat * quantity,
+        "sale_gross_unit_clp": sale_gross, "sale_net_unit_clp": sale_net,
+        "sale_vat_unit_clp": sale_vat, "sales_net_total_clp": sale_net * quantity,
+        "gross_profit_unit_clp": gross_profit, "gross_profit_total_clp": gross_profit * quantity,
+        "gross_margin_pct": gross_margin * 100, "commission_unit_clp": commission,
+        "variable_cost_unit_clp": variable_costs, "contribution_unit_clp": contribution,
+        "operating_profit_total_clp": total_operating_profit,
+        "operating_margin_pct": operating_margin * 100,
+        "max_purchase_unit_clp": max_purchase,
+        "capital_cash_clp": (landed + import_vat) * quantity + fixed_costs + variable_costs * quantity,
+        "break_even_units": __import__("math").ceil(fixed_costs / contribution) if contribution > 0 else None,
+        "assumptions": ["La utilidad operativa estimada es antes de impuesto a la renta.",
+                        "El IVA de importación se muestra como necesidad de caja; el costo neto supone que es recuperable como crédito fiscal si corresponde.",
+                        "El arancel se aplica sobre compra, flete y seguro por unidad; valida la base y tasa con un agente de aduanas."]
+    }
+    return {"product": product, "supplier": supplier, "quote_price": quote_price,
+            "currency": currency, "quantity": int(quantity), "inputs": data, "result": result}
+
+
 def connect_db():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
@@ -117,6 +202,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scenarios (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, product TEXT NOT NULL DEFAULT '',
             inputs_json TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS product_analyses (
+            id INTEGER PRIMARY KEY, product TEXT NOT NULL, quote_id INTEGER,
+            supplier TEXT NOT NULL DEFAULT '', quote_price REAL NOT NULL,
+            quote_currency TEXT NOT NULL, inputs_json TEXT NOT NULL,
+            result_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS exchange_rates (
             currency TEXT PRIMARY KEY, units_per_usd REAL NOT NULL,
@@ -1198,6 +1289,13 @@ class Handler(BaseHTTPRequestHandler):
                     row["result"] = json.loads(row.pop("result_json"))
                 self.send_json(rows)
                 return
+            if path == "/api/product-analyses":
+                rows = [dict(r) for r in db.execute("SELECT * FROM product_analyses ORDER BY id DESC LIMIT 100")]
+                for row in rows:
+                    row["inputs"] = json.loads(row.pop("inputs_json"))
+                    row["result"] = json.loads(row.pop("result_json"))
+                self.send_json(rows)
+                return
             if path == "/api/exchange-rates":
                 rows = [dict(r) for r in db.execute("SELECT currency,units_per_usd,rate_date,source,updated_at FROM exchange_rates ORDER BY currency")]
                 self.send_json(rows)
@@ -1466,6 +1564,38 @@ class Handler(BaseHTTPRequestHandler):
                                    (currency, value["rate"], value["date"], value.get("source", "Frankfurter (tasas de referencia)"), now))
                     rows = [dict(r) for r in db.execute("SELECT currency,units_per_usd,rate_date,source,updated_at FROM exchange_rates ORDER BY currency")]
                 self.send_json(rows)
+                return
+            if path in ("/api/product-analyses/preview", "/api/product-analyses"):
+                data = dict(payload)
+                with connect_db() as db:
+                    product = str(data.get("product", "")).strip()
+                    if not db.execute("SELECT 1 FROM products WHERE name=?", (product,)).fetchone():
+                        raise ValueError("Selecciona un producto válido del catálogo.")
+                    quote_id = data.get("quote_id")
+                    quote = None
+                    if quote_id not in (None, ""):
+                        try:
+                            quote_id = int(quote_id)
+                        except (TypeError, ValueError):
+                            raise ValueError("La cotización seleccionada no es válida.")
+                        quote = db.execute("SELECT * FROM quotes WHERE id=?", (quote_id,)).fetchone()
+                        if not quote or quote["product"] != product:
+                            raise ValueError("La cotización elegida no corresponde al producto seleccionado.")
+                        data.update({"quote_price": quote["unit_price"], "currency": quote["currency"],
+                                     "supplier": quote["supplier"]})
+                    analysis = calculate_product_economics(data)
+                    if path.endswith("/preview"):
+                        self.send_json(analysis)
+                        return
+                    created_at = datetime.now().isoformat(timespec="minutes")
+                    cursor = db.execute("""INSERT INTO product_analyses
+                        (product,quote_id,supplier,quote_price,quote_currency,inputs_json,result_json,created_at)
+                        VALUES(?,?,?,?,?,?,?,?)""", (analysis["product"], quote_id,
+                        analysis["supplier"], analysis["quote_price"], analysis["currency"],
+                        json.dumps(analysis["inputs"], ensure_ascii=False),
+                        json.dumps(analysis["result"], ensure_ascii=False), created_at))
+                    analysis.update({"id": cursor.lastrowid, "created_at": created_at, "quote_id": quote_id})
+                self.send_json(analysis)
                 return
             with connect_db() as db:
                 if path == "/api/products":
