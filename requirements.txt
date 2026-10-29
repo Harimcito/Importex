@@ -1,3 +1,9 @@
 pypdf>=5.0
 openpyxl>=3.1
 xlrd>=2.0.1
+winrt-runtime>=4.0.3; sys_platform == "win32"
+winrt-Windows.Globalization>=4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Graphics.Imaging>=4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Media.Ocr>=4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=4!10.0.28000.2705; sys_platform == "win32"
+
